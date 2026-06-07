@@ -65,6 +65,14 @@ class StationConfig:
     # SABIT SARJ BITIS KURALI: tum araclar %80 SoC'de biter.
     target_soc: float = 0.80
 
+    # MAKS SARJ UZATMA KATSAYISI (S) - madde 3:
+    # Algoritma bir araci, tam-guc (en kotu senaryo / bodoslama) ile gereken
+    # sureye gore EN FAZLA S katina kadar uzatabilir. Anlik verilen guc, aracin
+    # tam-guc kabiliyetinin 1/S'inin altina dusurulmez (guc tabani = p_hard / S).
+    # Boylece DC hizinin avantaji korunur; aksi halde sure 400+ dk'ya cikip
+    # araba AC ile sarj olmustan farksiz kalir.
+    max_stretch_factor: float = 3.0
+
     # SOH/C-rate guvenli sarj penceresi (optimize moda ozel):
     #   izin verilen max C-rate = crate_high - beta*(crate_high - crate_low)
     crate_high: float = 2.5   # beta=0 -> agresif
@@ -133,12 +141,22 @@ class PricingConfig:
     day_start_hour: int = 6
     peak_start_hour: int = 17
 
-    # ---- PTF/SMF piyasa parametreleri (EPIAS gerceklerine yakin, TL/MWh) ----
-    ptf_mean: float = 2400.0    # ortalama PTF (TL/MWh)
-    ptf_amplitude: float = 900.0  # gun-ici dalgalanma genligi
-    ptf_cap: float = 3400.0     # piyasa tavan fiyati (TL/MWh)
-    ptf_floor: float = 0.0      # taban (0 TL/MWh olabilir - bol arz)
-    smf_spread: float = 350.0   # SMF'nin PTF'den sapma genligi (dengesizlik)
+    # ---- PTF/SMF piyasa parametreleri (2026 EPIAS gerceklerine kalibre, TL/MWh) ----
+    # 2026 GERCEK PROFILI (EPIAS Seffaflik, ornek 07.06.2026):
+    #   - GUNDUZ 08:00-16:00: gunes bollugunda PTF GENIS bir pencerede ~0'a iner
+    #     (gercekte ~10 saatlik dar OLMAYAN bir bant; eski model burada hataliydi).
+    #   - AKSAM 19:00-21:00: puant tepe azami fiyata (~2700) firlar.
+    #   - GECE/SABAH: ~baz seviye (~700-800), yani gunduz sifirindan PAHALIDIR.
+    #   - Gunluk ortalama mevsim/havaya gore cok oynar (Mart'26 ~1620, Haz'26 ~390).
+    ptf_night_base: float = 800.0     # gece/baz seviye (TL/MWh)
+    ptf_night_dip: float = 250.0      # gece yarisi (03-05) ek dip
+    ptf_morning_bump: float = 350.0   # sabah omuz (07-09)
+    ptf_evening_peak: float = 2700.0  # aksam puant tepe (azami fiyat civari)
+    ptf_cap: float = 3000.0           # 2026 piyasa azami fiyati (TL/MWh)
+    ptf_floor: float = 0.0            # taban: yuksek-solar gunduzde ~0 olabilir
+    ptf_solar_min: float = 0.20       # dusuk-solar (bulutlu/kis) gun bastirma
+    ptf_solar_max: float = 1.00       # yuksek-solar gun -> gunduz penceresi ~0
+    smf_spread: float = 350.0         # SMF'nin PTF'den sapma genligi (dengesizlik)
 
 
 # --------------------------------------------------------------------------- #
@@ -165,7 +183,14 @@ class ThermalConfig:
     m_exp: float = 0.8
     tau_to_min: float = 180.0
     hs_reference_c: float = 110.0
-    normal_life_hours: float = 180000.0   # ≈ 20.55 yil
+    normal_life_hours: float = 180000.0   # ≈ 20.55 yil (termal yalitim referansi)
+
+    # FIZIKSEL TASARIM OMRU TAVANI (madde 2):
+    # Dusuk yuklenmede termal yaslanma ihmal edilebilir hale gelir ve IEEE LoL
+    # modelinin "esdeger omru" yuzlerce/binlerce yila cikar (FIZIKSEL DEGIL).
+    # Gercekte trafo omru nem, busing, OLTC, mekanik vb. nedenlerle tasarim
+    # omruyle sinirlidir; esdeger omur bu tavanla kirpilir.
+    design_life_years: float = 30.0
 
     # Ortam sicakligi (gun-ici sinuzoidal profil, °C)
     ambient_mean_c: float = 28.0

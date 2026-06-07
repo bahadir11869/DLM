@@ -154,16 +154,17 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 def generate_market_prices(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Son `days` gune ait EPIAS gerceklerine yakin PTF ve SMF egrileri uretir.
+    Son `days` gune ait, 2026 EPIAS gerceklerine KALIBRE PTF/SMF egrileri uretir.
 
-    PTF gun-ici sekli:
-      - Gece (00-06) dusuk
-      - Sabah tepe (08-11)
-      - Aksam puant tepe (18-21)
-      - GUNDUZ (10-16) GUNES/RUZGAR yogun -> PTF ~0 TL/MWh'ye kadar DUSER.
-        Yenilenebilir uretimin yuksek oldugu gunlerde ogle saatlerinde PTF
-        gercekte sifira yaklasir; bu, gunluk degisken bir "solar derinligi" ile
-        modellenir (her gun farkli).
+    2026 GUN-ICI PROFILI (gercek gozleme dayali, ornek 07.06.2026):
+      - GECE/SABAH (00-07): ~baz seviye (~800 TL/MWh), 03-05 arasi hafif dip.
+      - GUNDUZ (08-16): GUNES bollugunda PTF GENIS (yaklasik 8-10 saatlik) bir
+        platoda ~0'a iner. Bu pencere DAR DEGILDIR; yuksek-solar gunlerde butun
+        ogle bandi sifirlanir (eski modelin dar gaussian'i gercekci degildi).
+      - AKSAM PUANT (19-21): gunes cekilip talep zirve yapinca PTF azami fiyata
+        (~2700) sert bir tepe ile firlar (gunun en pahali saatleri).
+      - Gunluk ortalama, solar derinligi ve baz seviye gunden gune (hava/mevsim)
+        belirgin oynar; gece gunduz sifirindan PAHALIDIR.
 
     SMF, dengesizlik durumuna gore PTF etrafinda sapar (bazen > PTF, bazen < PTF).
 
@@ -172,38 +173,49 @@ def generate_market_prices(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(cfg.seed + 23)
     pc = cfg.pricing
     days = cfg.days
-
-    # ---- Saatlik gun-ici sekil (sabah + aksam tepe, gece dip) ----
     h = np.arange(24)
-    daily_shape = (
-        0.45 * np.exp(-((h - 9.0) ** 2) / (2 * 2.0 ** 2))     # sabah tepe
-        + 0.85 * np.exp(-((h - 19.5) ** 2) / (2 * 2.2 ** 2))  # aksam puant
-        - 0.40 * np.exp(-((h - 3.5) ** 2) / (2 * 2.5 ** 2))   # gece dip
+
+    # ---- GENIS ogle GUNES penceresi (08:00-16:00 duz plato) ----
+    # Iki lojistik kapinin carpimi -> duz tabanli "boxcar". Kenarlar 07-08 ve
+    # 16-17'de yumusakca acilir/kapanir. Bu, 0'a inisin GENIS olmasini saglar.
+    solar_window = (
+        1.0 / (1.0 + np.exp(-(h - 7.5) / 0.7))
+        * 1.0 / (1.0 + np.exp((h - 16.5) / 0.7))
     )
 
-    # ---- Gunluk ortalama seviye dalgalanmasi (hava/talep) ----
-    day_level = rng.normal(0.0, 0.12, size=days)         # gunler arasi ±%12
+    # ---- Bastirma ONCESI gun-ici sekil (mutlak TL/MWh) ----
+    # gece bazi - gece yarisi dip + sabah omuz  (aksam puant tepe AYRI eklenir)
+    base_shape = (
+        pc.ptf_night_base
+        - pc.ptf_night_dip * np.exp(-((h - 4.0) ** 2) / (2 * 2.5 ** 2))
+        + pc.ptf_morning_bump * np.exp(-((h - 8.0) ** 2) / (2 * 1.5 ** 2))
+    )
+    # Aksam puant tepe (~20:00) -> azami fiyat civari. Solar bastirmadan
+    # etkilenmez (o saatte solar_window ~0).
+    peak_shape = (pc.ptf_evening_peak - pc.ptf_night_base) * np.exp(
+        -((h - 20.0) ** 2) / (2 * 1.7 ** 2)
+    )
+
+    # ---- Gunluk degiskenlik (hava/mevsim/talep) ----
+    day_level = np.clip(rng.normal(1.0, 0.22, size=days), 0.55, 1.7)  # baz seviye carpani
     weekday = np.arange(days) % 7
-    weekend_adj = np.where(weekday >= 5, -0.08, 0.0)     # haftasonu daha ucuz
-
-    base = pc.ptf_mean
-    amp = pc.ptf_amplitude
-    ptf_hourly = (
-        base
-        + amp * daily_shape[None, :]
-        + base * (day_level[:, None] + weekend_adj[:, None])
-        + rng.normal(0.0, 90.0, size=(days, 24))          # saatlik gurultu
+    day_level = day_level * np.where(weekday >= 5, 0.90, 1.0)         # haftasonu ucuz
+    peak_daily = np.clip(rng.normal(1.0, 0.15, size=days), 0.6, 1.25)  # aksam tepe carpani
+    # solar derinligi: 2026'da cogu gun yuksek-solar; bazen bulutlu (dusuk).
+    solar_depth = np.clip(
+        rng.beta(2.4, 1.3, size=days) * (pc.ptf_solar_max - pc.ptf_solar_min)
+        + pc.ptf_solar_min, 0.0, 1.0,
     )
 
-    # ---- YENILENEBILIR (SOLAR) BASKILAMA: ogle saatlerinde PTF -> ~0 ----
-    #   solar_depth: her gun icin yenilenebilir yogunlugu (0=az, 1=cok gunes)
-    #   solar_hours: ogle (13:00) civarinda tepe yapan 0..1 pencere
-    #   carpan supp = 1 - solar_depth*solar_hours  -> yuksek-solar gunlerde
-    #   ogleyin supp~0 olur ve PTF sifira yaklasir.
-    solar_depth = rng.uniform(0.0, 1.0, size=days)
-    solar_hours = np.exp(-((h - 13.0) ** 2) / (2 * 2.4 ** 2))
-    supp = 1.0 - solar_depth[:, None] * solar_hours[None, :]
-    ptf_hourly = ptf_hourly * np.clip(supp, 0.0, 1.0)
+    # ---- Saatlik matris (days x 24) ----
+    ptf_hourly = (
+        base_shape[None, :] * day_level[:, None]
+        + peak_shape[None, :] * peak_daily[:, None]
+    )
+    # GENIS ogle penceresinde GUNES bastirmasi -> yuksek-solar gunde gunduz ~0
+    suppression = 1.0 - solar_depth[:, None] * solar_window[None, :]
+    ptf_hourly = ptf_hourly * np.clip(suppression, 0.0, 1.0)
+    ptf_hourly = ptf_hourly + rng.normal(0.0, 60.0, size=(days, 24))   # saatlik gurultu
     ptf_hourly = np.clip(ptf_hourly, pc.ptf_floor, pc.ptf_cap)
 
     # ---- SMF: dengesizlik yonune gore PTF etrafinda sapar ----

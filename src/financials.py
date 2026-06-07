@@ -115,7 +115,12 @@ def thermal_loss_of_life(cfg: SimConfig, facility_kw: np.ndarray) -> Dict[str, o
     #   Bu yuklenme profili surerse trafo, FAA katına orantili olarak daha
     #   erken biter. equiv_life_years = normal_life / (8760 * avg_FAA)
     avg_faa = lol_hours / max(real_hours, 1e-9)
-    equiv_life_years = th.normal_life_hours / (8760.0 * max(avg_faa, 1e-9))
+    # Esdeger omur, tasarim omru tavaniyla kirpilir (madde 2): dusuk yuklenmede
+    # avg_faa cok kuculur ve kirpilmazsa esdeger omur yuzlerce/binlerce yila cikar
+    # (fiziksel degil). Tavan, trafonun termal-disi (nem/busing/OLTC) omru sinirini
+    # temsil eder. Yine de iki senaryo arasindaki FARK (yaslanma maliyeti) korunur.
+    equiv_life_raw = th.normal_life_hours / (8760.0 * max(avg_faa, 1e-9))
+    equiv_life_years = min(th.design_life_years, equiv_life_raw)
 
     # Gunluk kumulatif yaslanma (grafik icin) - dakika dizisini gune indir
     faa_daily = FAA.reshape(-1, MINUTES_PER_DAY).sum(axis=1) * dt_h  # gun basina saat
@@ -243,22 +248,31 @@ def summarize_costs(cfg: SimConfig, res: SimResult) -> Dict[str, float]:
     """Enerji maliyeti, demand charge ve operasyonel KPI'lar (tek strateji)."""
     fin = cfg.financial
     dt = HOURS_PER_MINUTE
-    days = cfg.days
 
     energy_kwh_min = res.charging_kw * dt
     total_energy = float(energy_kwh_min.sum())
     energy_cost = float(np.sum(energy_kwh_min * res.price_tl_kwh))
 
     facility = res.facility_kw
-    n_months = max(1, int(np.ceil(days / 30.0)))
-    monthly_peak = np.array([
-        facility[mm * 30 * MINUTES_PER_DAY:(mm + 1) * 30 * MINUTES_PER_DAY].max()
-        if facility[mm * 30 * MINUTES_PER_DAY:(mm + 1) * 30 * MINUTES_PER_DAY].size else 0.0
-        for mm in range(n_months)
-    ])
-    demand_base = float((monthly_peak * fin.demand_charge_tl_per_kw).sum())
-    exceed = np.maximum(0.0, monthly_peak - fin.contracted_demand_kw)
-    demand_penalty = float((exceed * fin.demand_penalty_tl_per_kw).sum())
+    # AYLIK demand charge: her 30-gunluk blogun TEPE gucu uzerinden. KISMI (eksik)
+    # son ay, gun orani (frac) kadar AGIRLIKLANIR (madde 4 - maliyet hatasi).
+    # Boylece donem demand maliyeti GERCEK ay sayisiyla (days/30) orantili olur ve
+    # full_analysis'teki yillik projeksiyon (x365/days) TUTARLI kalir. Eski kod
+    # 100 gun icin 4 TAM ay sayip, sonra x3.65 ile yilda ~14.6 ay'a sisiriyordu.
+    block = 30 * MINUTES_PER_DAY
+    n_blocks = max(1, int(np.ceil(len(facility) / block)))
+    demand_base = 0.0
+    demand_penalty = 0.0
+    for mm in range(n_blocks):
+        seg = facility[mm * block:(mm + 1) * block]
+        if seg.size == 0:
+            continue
+        pk = float(seg.max())
+        frac = seg.size / block          # kismi ay agirligi (0..1)
+        demand_base += pk * fin.demand_charge_tl_per_kw * frac
+        demand_penalty += max(0.0, pk - fin.contracted_demand_kw) * fin.demand_penalty_tl_per_kw * frac
+    demand_base = float(demand_base)
+    demand_penalty = float(demand_penalty)
 
     sess = res.sessions
     return {

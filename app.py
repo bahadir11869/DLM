@@ -173,16 +173,19 @@ st.caption("1600 kVA Trafo · Tek-soketli Karisik DC Istasyonlar · PTF/SMF & IE
 # --------------------------------------------------------------------------- #
 with st.expander("ℹ️ Algoritma Nasil Calisir? (α, β, γ ve guc paylasimi)", expanded=False):
     st.markdown(r"""
-**Onemli:** Algoritma araclarin **istasyona giris/cikis saatini DEGISTIRMEZ**.
-Sadece, arac sokette bagliyken **gucu zaman icine yayar** (sarj suresini uzatip
-dusuk guce ceker) ve **ucuz saatlere agirlik verir**. Giris zamani sabittir.
+**Onemli:** Algoritma araclarin **istasyona giris/cikis saatini DEGISTIRMEZ** ve
+araci baska saate TASIMAZ. Sadece, arac **kendi fis-takili penceresi icinde**
+gucu zamana yayar (sarj suresini uzatip dusuk guce ceker) ve bu pencere icindeki
+**ucuz dakikalara daha cok yuk bindirir**. Giris/cikis zamani sabittir.
 
 **Her dakika:**
 1. **Acil guc:** Her aracin %80'e zamaninda ulasmasi icin gereken asgari guc daima
    verilir (tamamlanma garantisi).
 2. **Firsatci guc:** Her arac icin *gelecek-farkindali* fiyat sinyali — aracin
-   **kalan suresindeki ortalama fiyata** gore "su an ucuz mu?" — ile, γ oraninda
-   ek sarj ucuz saatlere kaydirilir (pahalida ertelenir).
+   **kalan fis-takili suresindeki ortalama fiyata** gore "su an ucuz mu?" — ile,
+   γ oraninda opsiyonel sarj, **aracin kendi penceresi icindeki** ucuz dakikalara
+   bindirilir (pahali dakikalarda kisilip ucuz dakikalara birakilir; arac
+   baska saate tasinmaz, sadece guc profili sekillenir).
 3. **Trafo + ±60 kW ramp:** Toplam (baz+sarj) yuk trafo anmasini asamaz; dakikalik
    degisim ±60 kW.
 4. **ESIT OLMAYAN paylasim:** Toplam guc araclara **oncelik skoruna** gore dagitilir:
@@ -194,7 +197,7 @@ dusuk guce ceker) ve **ucuz saatlere agirlik verir**. Giris zamani sabittir.
 |---|---|
 | **α – Sure** | Daha hizli sarj, kisa sure, tamamlanma ↑ (C-rate ↑) |
 | **β – SOH** | Dusuk C-rate, batarya korunur, sure biraz uzar |
-| **γ – Maliyet** | Sarj ucuz saatlere kayar, enerji maliyeti ↓ |
+| **γ – Maliyet** | Guc, pencere icindeki ucuz dakikalara bindirilir, enerji maliyeti ↓ |
 
 Bunlar **goreli agirliklardir**: birini arttirip digerlerini sabit tutmak, o hedefe
 **daha fazla oncelik** vermek demektir; **Toplam Tasarruf** uc hedefin bileskesidir
@@ -230,6 +233,8 @@ if st.session_state.get("_do_run"):
             use_epias=use_epias, epias_user=epias_user, epias_pass=epias_pass,
         )
         st.session_state["payload"] = run_simulation(base_mult=1.0, **st.session_state["params"])
+        # Baz yuk +%15 (guc asim cezasi) senaryosu her calistirmada OTOMATIK uretilir.
+        st.session_state["P15"] = run_simulation(base_mult=1.15, **st.session_state["params"])
     st.session_state["_do_run"] = False
 
 if "payload" not in st.session_state:
@@ -352,7 +357,11 @@ with tabB:
                   f"{th_n['theta_hs_peak']:.0f}→{th_o['theta_hs_peak']:.0f} °C",
                   help="110°C uzeri yalitimda hizlandirilmis yaslanma baslar.")
         k2.metric("Esdeger Trafo Omru (Once→Sonra)",
-                  f"{th_n['equiv_life_years']:.0f}→{th_o['equiv_life_years']:.0f} yil")
+                  f"{th_n['equiv_life_years']:.0f}→{th_o['equiv_life_years']:.0f} yil",
+                  help="Termal yaslanmaya gore esdeger omur. Dusuk yuklenmede termal "
+                       "yaslanma ihmal edilebilir oldugundan deger, fiziksel tasarim omru "
+                       "(~30 yil) tavaniyla kirpilir; gercek omru nem/busing/OLTC gibi "
+                       "etkenler sinirlar. Iki senaryo arasindaki fark anlamlidir.")
         k3.metric("Tuketilen Omur (Once→Sonra)",
                   f"%{th_n['pct_life_consumed']:.4f}→%{th_o['pct_life_consumed']:.4f}")
         k4.metric("Onlenen Yaslanma (100g / yillik)", fmt_tl(A["thermal_saving_tl"]),
@@ -394,14 +403,11 @@ with tabB:
                 "Korunan Batarya Bedeli (TL)": "{:,.0f}",
             }), use_container_width=True, hide_index=True, height=430)
 
-    # ---- Senaryo-7: Baz Yuk +%15 ----
+    # ---- Senaryo-7: Baz Yuk +%15 (her calistirmada otomatik) ----
     with st.expander("📊 Senaryo: Baz Yuk +%15 → Guc Asim Cezasi (madde 7)", expanded=True):
         st.caption("Ayni istasyon ve araclar sabit; baz yuk %15 artirildiginda mevcut "
-                   "kurulumun yarattigi GUC ASIM CEZASI (EPDK) gosterilir.")
-        if st.button("🔺 Baz Yuk +%15 Senaryosunu Hesapla"):
-            with st.spinner("+%15 baz yuk ile yeniden simule ediliyor..."):
-                P15 = run_simulation(base_mult=1.15, **st.session_state["params"])
-            st.session_state["P15"] = P15
+                   "kurulumun yarattigi GUC ASIM CEZASI (EPDK) gosterilir. Bu senaryo her "
+                   "simulasyonda otomatik hesaplanir.")
         if "P15" in st.session_state:
             P15 = st.session_state["P15"]
             colp = st.columns(4)

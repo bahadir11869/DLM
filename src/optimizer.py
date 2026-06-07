@@ -135,6 +135,7 @@ def simulate(
     dt = HOURS_PER_MINUTE
     target = st.target_soc
     ramp = st.ramp_kw_per_min
+    stretch = max(st.max_stretch_factor, 1.0)   # madde 3: maks sarj uzatma katsayisi
     rated = st.rated_kw
     max_load = st.opt_max_loading_pu
     is_opt = (strategy == "optimized")
@@ -253,9 +254,14 @@ def simulate(
 
         if smart_active:
             # SOH-dostu yumusak tavan; ACILIYET bunu gecersiz kilabilir.
+            # GUC TABANI (madde 3 - geri besleme): anlik guc, aracin tam-guc
+            # (p_hard, "en kotu senaryo") kabiliyetinin 1/S'inin altina inmesin.
+            # Boylece toplam sarj suresi <= S x minimum kalir ve DC hizinin
+            # avantaji korunur (uzun, AC-benzeri dusuk-guc kuyruklari onlenir).
+            p_floor = p_hard / stretch
             p_soft = np.minimum(p_hard, crate_cap * cap_a)
             need_cap = np.minimum(p_hard, p_need)
-            pmax = np.clip(np.maximum(p_soft, need_cap), 0.0, p_hard)
+            pmax = np.clip(np.maximum.reduce([p_soft, need_cap, p_floor]), 0.0, p_hard)
             C_t = max(0.0, rated * max_load - base_load[t])   # trafo korumasi
         else:
             # Bodoslama / algoritma-pasif: trafo limiti ve C-rate uygulanmaz.
@@ -269,18 +275,23 @@ def simulate(
             # 1) ACIL guc: her aracin deadline'a yetismesi icin SART olan kisim.
             #    Bu daima verilir (servis garantisi). ALPHA, p_need uzerinden
             #    bu kismi buyutur -> daha hizli sarj.
-            p_urgent = np.minimum(p_need, pmax)
+            # ACIL + GARANTILI TABAN: deadline gucu (p_need) ile guc tabani
+            # (p_floor) her arac icin GARANTI edilir (asagida once tahsis edilir).
+            p_urgent = np.minimum(np.maximum(p_need, p_floor), pmax)
 
-            # 2) FIRSATCI guc: acil olmayan, "istege bagli" sarj. Her arac icin
+            # 2) FIRSATCI guc: acil olmayan, "istege bagli" sarj. ONEMLI: bu islem
+            #    araci BASKA SAATE TASIMAZ; aracin geliş/cikis zamani sabittir. Sadece
+            #    aracin KENDI fis-takili penceresi icinde gucu pahali dakikalardan
+            #    ucuz dakikalara dogru SEKILLENDIRIR (load shaping). Her arac icin
             #    GELECEK-FARKINDALI fiyat sinyali:
             #       future_mean_i = aracin KALAN penceresindeki ortalama fiyat
             #       rel_i = (future_mean_i - fiyat_t) / fiyat_araligi
-            #               > 0  -> "su an, gelecekteki ortalamadan UCUZ" (sarj et)
-            #               < 0  -> "su an pahali, ucuz saatleri BEKLE" (ertele)
+            #               > 0  -> "su an, kendi penceresinin ortalamasindan UCUZ" (yuklen)
+            #               < 0  -> "su an pahali, opsiyonel gucu KIS" (pencere ici bekle)
             #       opp_frac_i = ALPHA*0.45        (proaktif taban -> tamamlanma)
-            #                  + GAMMA*1.5*rel_i    (ucuza kaydirir, pahalida erteler)
-            #    GAMMA arttikca sarj, pahali saatlerden UCUZ saatlere AKTIF olarak
-            #    kaydirilir -> enerji maliyeti monoton DUSER; tamamlanma ~sabit kalir.
+            #                  + GAMMA*1.5*rel_i    (pencere ici ucuz dakikaya bindirir)
+            #    GAMMA arttikca opsiyonel guc, pencere icindeki pahali dakikalardan
+            #    UCUZ dakikalara kaydirilir -> enerji maliyeti DUSER; tamamlanma ~sabit.
             dep_v = np.minimum(dep[veh], T)
             win = np.maximum(dep_v - t, 1)
             future_mean = (cumprice[dep_v] - cumprice[t]) / win
@@ -310,7 +321,17 @@ def simulate(
             cap_norm = cap_a / (cap_a.max() + 1e-9)
             w = (0.6 + weights.alpha) * urg_norm + 0.8 * soc_need \
                 + weights.beta * cap_norm + 1e-3
-            alloc = _waterfill(T_t, pmax, w)
+            # ONCE garantili taban (acil + guc tabani) tahsis edilir; KALAN
+            # firsatci guc oncelik agirligiyla dagitilir. Boylece guc tabani
+            # fiilen GARANTI olur (trafo/ramp tavani yettigi surece) ve sarj
+            # suresi S katiyla sinirli kalir. Tavan dar oldugunda (ramp/trafo
+            # kisiti) tabana inilemezse oncelik agirligina gore tahsis edilir.
+            g_sum = float(p_urgent.sum())
+            if T_t <= g_sum + 1e-9:
+                alloc = _waterfill(T_t, pmax, w)
+            else:
+                extra = _waterfill(T_t - g_sum, pmax - p_urgent, w)
+                alloc = p_urgent + extra
         else:
             # BODOSLAMA / algoritma-pasif: herkes maksimum (istasyon-limitli),
             # ramp/fiyat/trafo/C-rate YOK. Paylasim yine tavanlara orantilidir.
