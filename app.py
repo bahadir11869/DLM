@@ -42,11 +42,13 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 @st.cache_data(show_spinner=False)
 def run_simulation(scenario, pricing_mode, days, seed, regen_token, fleet_size,
                    n200, n180, n120, alpha, beta, gamma, activation_mode,
-                   use_epias, epias_user, epias_pass, base_mult):
+                   use_epias, epias_user, epias_pass, base_mult,
+                   pf=1.0, charge_eff=0.92):
     eff_seed = int(seed) + int(regen_token) * 7919
     cfg = SimConfig(
         days=days, seed=eff_seed,
-        station=StationConfig(n_socket_200=n200, n_socket_180=n180, n_socket_120=n120),
+        station=StationConfig(n_socket_200=n200, n_socket_180=n180, n_socket_120=n120,
+                              power_factor=float(pf), charge_efficiency=float(charge_eff)),
         pricing=PricingConfig(mode=pricing_mode, use_epias=use_epias,
                               epias_username=epias_user, epias_password=epias_pass),
         thermal=ThermalConfig(), financial=FinancialConfig(),
@@ -142,6 +144,14 @@ n200 = c1.number_input("200 kW", 0, 12, 2)
 n180 = c2.number_input("180 kW", 0, 12, 1)
 n120 = c3.number_input("120 kW", 0, 12, 2)
 
+with st.sidebar.expander("⚙️ Gelismis: Guc Faktoru & Sarj Verimi", expanded=False):
+    pf = st.slider("Guc faktoru (cosφ)", 0.85, 1.00, 1.00, 0.01,
+        help="Tesis guc faktoru. pf<1 ise trafo gorunur guc (kVA) cinsinden daha cok "
+             "yuklenir (anma kW = kVA×pf); termal yaslanma artar.")
+    charge_eff = st.slider("Sarj verimi (sebeke→batarya)", 0.85, 1.00, 0.92, 0.01,
+        help="DC sarj donusum/isil verimi. Sebekeden cekilen (faturalanan + trafo yuku) "
+             "guc = batarya gucu / verim. Dusukse maliyet ve trafo yuku artar.")
+
 st.sidebar.markdown("#### 🤖 Algoritma Devreye Girme")
 activation_label = st.sidebar.radio("Algoritma ne zaman calissin?",
     ["Her zaman", "Sadece puant (trafo doluluk ≥ %60)"],
@@ -231,6 +241,7 @@ if st.session_state.get("_do_run"):
             n200=int(n200), n180=int(n180), n120=int(n120),
             alpha=alpha, beta=beta, gamma=gamma, activation_mode=activation_mode,
             use_epias=use_epias, epias_user=epias_user, epias_pass=epias_pass,
+            pf=float(pf), charge_eff=float(charge_eff),
         )
         st.session_state["payload"] = run_simulation(base_mult=1.0, **st.session_state["params"])
         # Baz yuk +%15 (guc asim cezasi) senaryosu her calistirmada OTOMATIK uretilir.
@@ -262,11 +273,27 @@ else:
         f"**{maxinstall:.0f} kW**. Statik guvenli kurulum.")
 
 top = st.columns(4)
-top[0].metric("Toplam Tasarruf (100 gun)", fmt_tl(A["total_saving_tl"]))
+top[0].metric(f"Toplam Tasarruf ({P['cfg_days']} gun)", fmt_tl(A["total_saving_tl"]))
 top[1].metric("Yillik Projeksiyon", fmt_tl(A["annual_total_saving_tl"]))
 top[2].metric("Trafo Tepe (Once→Sonra)",
               f"{P['peak_naive']:.0f}→{P['peak_opt']:.0f} kW")
 top[3].metric("Filo / Oturum", f"{P['fleet_size']} / {P['n_sessions']}")
+
+# B1: Tamamlanma orani (algoritmanin araclari ac birakmadiginin kaniti) + ekstra KPI
+comp_opt = A["costs_opt"]["completion_rate"] * 100.0
+comp_naive = A["costs_naive"]["completion_rate"] * 100.0
+k = st.columns(4)
+k[0].metric("Tamamlanma — Algoritmali", f"%{comp_opt:.1f}",
+            f"{comp_opt - comp_naive:+.1f} puan vs bodoslama",
+            help="%80 SoC'ye ulasan oturum orani. Algoritma araclari ac BIRAKMAMALIDIR; "
+                 "bu KPI optimizasyonun tamamlanmayi feda etmedigini kanitlar.")
+k[1].metric("Tamamlanma — Bodoslama", f"%{comp_naive:.1f}")
+k[2].metric("Sozlesme Gucu", f"{P['contracted_kw']:.0f} kW",
+            help="Guc asim cezasi bu esigin uzerinde baslar. Optimize tepe bu degere cekilir.")
+k[3].metric("Ort. Sarj Suresi (Algo)", f"{A['costs_opt']['avg_charge_duration_min']:.0f} dk",
+            f"bodoslama {A['costs_naive']['avg_charge_duration_min']:.0f} dk",
+            help="Ortalama tekil oturum sarj suresi. Madde 3 (guc tabani, S=3) ile "
+                 "asiri uzamasi engellenir.")
 
 tabA, tabB = st.tabs(["📅 BOLUM A · 1 Gunluk Mikro Analiz", "📈 BOLUM B · 100 Gunluk Makro Analiz"])
 
@@ -288,12 +315,13 @@ with tabA:
     chg_opt = P["charging_opt"][lo:hi]; chg_naive = P["charging_naive"][lo:hi]; price_d = P["price"][lo:hi]
 
     with st.expander("🔋 Kombine Yuk ve Maliyet Egrisi", expanded=True):
-        g = st.columns(5)
+        g = st.columns(6)
         show_base = g[0].checkbox("Baz Yuk", True)
         show_naive = g[1].checkbox("Algoritma Oncesi", True)
         show_opt = g[2].checkbox("Algoritma Sonrasi", True)
         show_rated = g[3].checkbox("Trafo Anma", True)
-        show_price = g[4].checkbox("Fiyat Egrisi", True)
+        show_contract = g[4].checkbox("Sozlesme Gucu", True)
+        show_price = g[5].checkbox("Fiyat Egrisi", True)
         fig, ax = plt.subplots(figsize=(12, 5))
         if show_base:
             ax.fill_between(x, 0, base, color="#5f6368", alpha=0.45, label="Baz Yuk", zorder=1)
@@ -305,6 +333,9 @@ with tabA:
         if show_rated:
             ax.axhline(P["rated_kw"], color="black", ls="--", lw=1.3,
                        label=f"Trafo Anma ({P['rated_kw']:.0f} kW)", zorder=2)
+        if show_contract:
+            ax.axhline(P["contracted_kw"], color="#ea8600", ls="-.", lw=1.3,
+                       label=f"Sozlesme Gucu ({P['contracted_kw']:.0f} kW)", zorder=2)
         ax.set_xlabel("Saat"); ax.set_ylabel("Guc (kW)")
         ax.set_xlim(0, 24); ax.set_xticks(range(0, 25, 2)); ax.grid(alpha=0.25)
         handles, labels = ax.get_legend_handles_labels()
@@ -431,3 +462,113 @@ with tabB:
     f[1].metric("Demand Charge Tasarrufu", fmt_tl(A["demand_saving_tl"]))
     f[2].metric("Trafo Omru Tasarrufu", fmt_tl(A["thermal_saving_tl"]))
     f[3].metric("SOH (Batarya) Tasarrufu", fmt_tl(A["soh_saving_tl"]))
+
+    # ---- B3: Çoklu-seed Monte Carlo (tasarruf dağılımı) ----
+    with st.expander("🎲 Coklu-seed Monte Carlo (tasarruf ne kadar sansa bagli?)", expanded=False):
+        st.caption("Ayni parametreler, FARKLI rastgele tohumlarla N kez kosulur; toplam "
+                   "tasarrufun ortalamasi ve dagilimi gosterilir. Dar dagilim -> sonuc saglam.")
+        n_runs = st.slider("Tohum (seed) sayisi", 3, 20, 8, key="mc_n")
+        if st.button("🎲 Monte Carlo Calistir"):
+            bp0 = dict(st.session_state["params"])
+            totals, annuals, comps, peaks = [], [], [], []
+            prog = st.progress(0.0, text="Simulasyonlar kosuluyor...")
+            for i in range(n_runs):
+                bp = dict(bp0); bp["seed"] = int(bp0["seed"]) + i * 101
+                r = run_simulation(base_mult=1.0, **bp)
+                an = r["analysis"]
+                totals.append(an["total_saving_tl"]); annuals.append(an["annual_total_saving_tl"])
+                comps.append(an["costs_opt"]["completion_rate"] * 100.0)
+                peaks.append(r["peak_opt"])
+                prog.progress((i + 1) / n_runs, text=f"{i+1}/{n_runs}")
+            prog.empty()
+            st.session_state["mc"] = dict(totals=np.array(totals), annuals=np.array(annuals),
+                                          comps=np.array(comps), peaks=np.array(peaks))
+        if "mc" in st.session_state:
+            mc = st.session_state["mc"]
+            mcc = st.columns(4)
+            mcc[0].metric("Toplam Tasarruf (ort)", fmt_tl(mc["totals"].mean()),
+                          f"±{fmt_tl(mc['totals'].std())} (std)")
+            mcc[1].metric("Yillik (ort)", fmt_tl(mc["annuals"].mean()))
+            mcc[2].metric("Tamamlanma (ort)", f"%{mc['comps'].mean():.1f}")
+            mcc[3].metric("Opt Tepe (ort)", f"{mc['peaks'].mean():.0f} kW")
+            cv = mc["totals"].std() / max(mc["totals"].mean(), 1e-9) * 100.0
+            figm, axm = plt.subplots(figsize=(10, 3))
+            axm.hist(mc["totals"], bins=min(12, len(mc["totals"])), color="#1a73e8", alpha=0.8)
+            axm.axvline(mc["totals"].mean(), color="#d93025", ls="--", lw=2, label="ortalama")
+            axm.set_xlabel("Toplam Tasarruf (TL)"); axm.set_ylabel("Gun/kosum sayisi")
+            axm.legend(fontsize=8); axm.grid(alpha=0.25)
+            figm.tight_layout(); st.pyplot(figm); plt.close(figm)
+            st.info(f"Degiskenlik katsayisi (CV) = **%{cv:.1f}**. Dusukse (≈<%15) tasarruf "
+                    f"sansa az bagli, sonuc saglamdir.")
+
+    # ---- B7: Soket kurulumu karşılaştırma matrisi ----
+    with st.expander("🔧 Soket Kurulumu Karsilastirma (hangi kurulum daha iyi?)", expanded=False):
+        st.caption("Ayni filo/parametreyle farkli soket kombinasyonlarini yan yana kosar.")
+        presets = {
+            "Mevcut": (int(n200), int(n180), int(n120)),
+            "Hafif (1/1/1)": (1, 1, 1),
+            "Orta (2/2/2)": (2, 2, 2),
+            "Agir (3/3/2)": (3, 3, 2),
+        }
+        if st.button("🔧 Kurulumlari Karsilastir"):
+            rows = []
+            prog = st.progress(0.0)
+            items = list(presets.items())
+            for j, (nm, (a, b, c)) in enumerate(items):
+                bp = dict(st.session_state["params"]); bp["n200"], bp["n180"], bp["n120"] = a, b, c
+                r = run_simulation(base_mult=1.0, **bp); an = r["analysis"]
+                rows.append({
+                    "Kurulum": nm, "Kurulu kW": r["installed_kw"],
+                    "Opt Tepe (kW)": r["peak_opt"], "Naive Tepe (kW)": r["peak_naive"],
+                    "Toplam Tasarruf (TL)": an["total_saving_tl"],
+                    "Tamamlanma (%)": an["costs_opt"]["completion_rate"] * 100.0,
+                })
+                prog.progress((j + 1) / len(items))
+            prog.empty()
+            st.session_state["cmp"] = pd.DataFrame(rows)
+        if "cmp" in st.session_state:
+            st.dataframe(st.session_state["cmp"].style.format({
+                "Kurulu kW": "{:.0f}", "Opt Tepe (kW)": "{:.0f}", "Naive Tepe (kW)": "{:.0f}",
+                "Toplam Tasarruf (TL)": "{:,.0f}", "Tamamlanma (%)": "{:.1f}",
+            }), use_container_width=True, hide_index=True)
+
+    # ---- B9: PTF kalibrasyon doğrulama (2026 referans profili) ----
+    with st.expander("📡 PTF Kalibrasyon Dogrulama (sentetik vs 2026 referans)", expanded=False):
+        st.caption("Sentetik PTF'nin saatlik ortalama profili, 2026 gercek EPIAS profiliyle "
+                   "(genis ogle ~0 + sert aksam puant) karsilastirilir.")
+        ptf_arr = np.asarray(P["ptf"], dtype=float)
+        n_full_days = len(ptf_arr) // 1440
+        synth_hourly = ptf_arr[:n_full_days * 1440].reshape(n_full_days, 24, 60).mean(axis=2).mean(axis=0)
+        # 2026 yuksek-solar gun referansi (TL/MWh, yaklasik; EPIAS gozlemine dayali)
+        ref_2026 = np.array([700, 660, 600, 560, 545, 575, 690, 700, 520, 360,
+                             180, 90, 60, 70, 140, 360, 620, 1000, 1700, 2350,
+                             2700, 2400, 1700, 1150], dtype=float)
+        hrs = np.arange(24)
+        figp, axp = plt.subplots(figsize=(11, 3.4))
+        axp.plot(hrs, synth_hourly, color="#1a73e8", lw=2.2, marker="o", ms=3, label="Sentetik (ort.)")
+        axp.plot(hrs, ref_2026, color="#ea8600", lw=2.0, ls="--", label="2026 referans (yuksek-solar gun)")
+        axp.set_xlabel("Saat"); axp.set_ylabel("PTF (TL/MWh)")
+        axp.set_xticks(range(0, 24, 2)); axp.grid(alpha=0.25); axp.legend(fontsize=8)
+        figp.tight_layout(); st.pyplot(figp); plt.close(figp)
+        st.caption(f"Sentetik gun ort: {ptf_arr.mean():.0f} TL/MWh · ogle(11-15) ort: "
+                   f"{synth_hourly[11:15].mean():.0f} · aksam(19-21) ort: {synth_hourly[19:22].mean():.0f}")
+
+    # ---- B6: Sonuç dışa aktarım (CSV) ----
+    with st.expander("💾 Sonuclari Disa Aktar (CSV)", expanded=False):
+        kpi_df = pd.DataFrame([
+            ("Toplam Tasarruf (TL)", A["total_saving_tl"]),
+            ("Yillik Projeksiyon (TL)", A["annual_total_saving_tl"]),
+            ("Enerji Tasarrufu (TL)", A["energy_saving_tl"]),
+            ("Demand Charge Tasarrufu (TL)", A["demand_saving_tl"]),
+            ("Trafo Omru Tasarrufu (TL)", A["thermal_saving_tl"]),
+            ("SOH Tasarrufu (TL)", A["soh_saving_tl"]),
+            ("Opt Tepe (kW)", P["peak_opt"]),
+            ("Naive Tepe (kW)", P["peak_naive"]),
+            ("Tamamlanma Opt (%)", A["costs_opt"]["completion_rate"] * 100.0),
+            ("Tamamlanma Naive (%)", A["costs_naive"]["completion_rate"] * 100.0),
+        ], columns=["KPI", "Deger"])
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇️ KPI Ozeti (CSV)", kpi_df.to_csv(index=False).encode("utf-8-sig"),
+                           "kpi_ozet.csv", "text/csv", use_container_width=True)
+        d2.download_button("⬇️ Arac Tablosu (CSV)", soh["table"].to_csv(index=False).encode("utf-8-sig"),
+                           "arac_tablosu.csv", "text/csv", use_container_width=True)

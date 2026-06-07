@@ -138,7 +138,17 @@ def simulate(
     stretch = max(st.max_stretch_factor, 1.0)   # madde 3: maks sarj uzatma katsayisi
     rated = st.rated_kw
     max_load = st.opt_max_loading_pu
+    eff = float(min(max(st.charge_efficiency, 0.5), 1.0))  # A4: sebeke->batarya verimi
     is_opt = (strategy == "optimized")
+
+    # A1: OPTIMIZE HEDEF TAVANI = min(fiziksel trafo, sozlesme gucu).
+    # Ekonomik ceza esigi (sozlesme gucu, 1400) trafo anmasindan (1600) dusukse,
+    # optimize tepeyi SOZLESME gucune cekmeye calisir -> guc asim cezasi sifirlanir.
+    # (Naive bu tavani yok sayar; fiziksel olarak trafoyu da asabilir -> overload.)
+    cap_kw = rated * max_load
+    contracted = float(cfg.financial.contracted_demand_kw)
+    if contracted > 0:
+        cap_kw = min(cap_kw, contracted)
     is_factory = cfg.scenario.is_factory
     activation_mode = cfg.activation_mode
     peak_threshold = cfg.peak_loading_threshold
@@ -242,33 +252,43 @@ def simulate(
         p_taper = hw_a * _soc_taper(soc_a)
         p_hard = np.maximum(np.minimum(p_taper, p_energy), 0.0)  # C-rate'i yok sayar
 
-        # ALGORITMA DEVREYE GIRME POLITIKASI (madde 6):
-        #   - "always": her dakika akilli dagitim.
-        #   - "peak_only": SADECE trafo doluluk orani (baz_yuk/anma) esigi astiginda
-        #     akilli dagitim; aksi halde BODOSLAMA gibi (yonetimsiz, tam guc) calisir.
-        loading = base_load[t] / rated
-        smart_active = is_opt and (
+        # ALGORITMA DEVREYE GIRME POLITIKASI (madde 6 + A2):
+        #   - is_opt icin TRAFO/SOZLESME KORUMASI ve ramp DAIMA aciktir; bu fiziksel
+        #     guvenliktir, kapatilamaz (aksi halde "peak_only"da gece filo dalgasinda
+        #     baz dusukken sarj trafoyu asardi - A2 hatasi).
+        #   - FIYAT/SOH OPTIMIZASYONU (price_smart) ise aktivasyona baglidir:
+        #       "always"    -> her dakika.
+        #       "peak_only" -> sadece (baz + TALEP EDILEN sarj) doluluk esigi astiginda;
+        #                      altinda trafo-korumali ama fiyat/SOH'suz "acgozlu doldur".
+        demanded_grid = float(p_hard.sum()) / eff     # talep edilen sarjin sebeke karsiligi
+        loading = (base_load[t] + demanded_grid) / rated
+        price_smart = is_opt and (
             activation_mode == "always" or loading >= peak_threshold
         )
         headroom_out[t] = max(0.0, rated * max_load - base_load[t])
 
-        if smart_active:
-            # SOH-dostu yumusak tavan; ACILIYET bunu gecersiz kilabilir.
-            # GUC TABANI (madde 3 - geri besleme): anlik guc, aracin tam-guc
-            # (p_hard, "en kotu senaryo") kabiliyetinin 1/S'inin altina inmesin.
-            # Boylece toplam sarj suresi <= S x minimum kalir ve DC hizinin
-            # avantaji korunur (uzun, AC-benzeri dusuk-guc kuyruklari onlenir).
-            p_floor = p_hard / stretch
-            p_soft = np.minimum(p_hard, crate_cap * cap_a)
-            need_cap = np.minimum(p_hard, p_need)
-            pmax = np.clip(np.maximum.reduce([p_soft, need_cap, p_floor]), 0.0, p_hard)
-            C_t = max(0.0, rated * max_load - base_load[t])   # trafo korumasi
+        # GUC TABANI (madde 3 - geri besleme): anlik guc, aracin tam-guc kabiliyetinin
+        # 1/S'inin altina inmesin -> sarj suresi <= S x minimum (DC avantaji korunur).
+        p_floor = p_hard / stretch
+
+        if is_opt:
+            if price_smart:
+                # SOH-dostu yumusak C-rate tavani + guc tabani; ACILIYET gecersiz kilabilir.
+                p_soft = np.minimum(p_hard, crate_cap * cap_a)
+                need_cap = np.minimum(p_hard, p_need)
+                pmax = np.clip(np.maximum.reduce([p_soft, need_cap, p_floor]), 0.0, p_hard)
+            else:
+                # Optimizasyon-pasif ama TRAFO-KORUMALI: C-rate/fiyat yok, sadece tavan altinda doldur.
+                pmax = p_hard
+            # Trafo/sozlesme headroom'u SEBEKE tarafindadir; batarya tarafina verimle cevrilir
+            # (alloc batarya gucudur; sebeke = alloc/eff). Boylece baz+sarj(sebeke) <= cap_kw.
+            C_t = max(0.0, cap_kw - base_load[t]) * eff
         else:
-            # Bodoslama / algoritma-pasif: trafo limiti ve C-rate uygulanmaz.
+            # Bodoslama (naive): trafo limiti, sozlesme, ramp ve C-rate YOK -> overload mumkun.
             pmax = p_hard
             C_t = float(pmax.sum())
 
-        if smart_active:
+        if is_opt and price_smart:
             # ============================================================== #
             #  HEDEF TOPLAM GUC  T_des = (ACIL) + (FIRSATCI)
             # ============================================================== #
@@ -332,21 +352,28 @@ def simulate(
             else:
                 extra = _waterfill(T_t - g_sum, pmax - p_urgent, w)
                 alloc = p_urgent + extra
+        elif is_opt:
+            # TRAFO-KORUMALI ama OPTIMIZASYON-PASIF (peak_only, esik altinda - A2):
+            # fiyat/SOH yok ama trafo/sozlesme tavani ve ramp UYGULANIR (overload yok).
+            T_des = float(pmax.sum())
+            T_ramp = min(max(T_des, prev_total - ramp), prev_total + ramp)
+            T_t = float(np.clip(T_ramp, 0.0, min(C_t, float(pmax.sum()))))
+            alloc = _waterfill(T_t, pmax, pmax)
         else:
-            # BODOSLAMA / algoritma-pasif: herkes maksimum (istasyon-limitli),
+            # BODOSLAMA / naive: herkes maksimum (istasyon-limitli),
             # ramp/fiyat/trafo/C-rate YOK. Paylasim yine tavanlara orantilidir.
             T_t = float(pmax.sum())
             alloc = _waterfill(T_t, pmax, pmax)
 
-        # (f) entegrasyon
-        energy = alloc * dt
+        # (f) entegrasyon. alloc = BATARYA tarafi guc (kW); SEBEKE = alloc/eff (A4).
+        energy = alloc * dt                      # bataryaya giren enerji (kWh)
         soc[veh] = soc_a + energy / cap_a
         delivered[veh] += energy
-        crate = alloc / cap_a
+        crate = alloc / cap_a                    # batarya C-rate (SOH stresi)
         stress_thr[veh] += energy * (1.0 + cfg.financial.soh_crate_k * crate ** 2)
 
-        prev_total = float(alloc.sum())
-        charging_out[t] = prev_total
+        prev_total = float(alloc.sum())          # batarya tarafi (ramp referansi)
+        charging_out[t] = prev_total / eff       # SEBEKE tarafi (trafo yuku + faturalanan)
 
     # --- Oturum sonuc tablosu ---
     res = s.copy()

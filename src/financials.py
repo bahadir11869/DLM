@@ -46,6 +46,7 @@ def build_price_signal(cfg: SimConfig, ptf_min: np.ndarray, smf_min: np.ndarray)
     Aktif fiyatlandirma moduna gore enerji birim fiyatini (TL/kWh) dondurur.
       - mode="PTF"   : PTF (TL/MWh) -> TL/kWh donusumu (/1000). Buyuk fabrika.
       - mode="TARIFE": 3-zamanli tarife (TL/kWh). Kucuk tesis.
+    NOT: SMF kullanilMAZ (yalnizca referans/bilgi amaclidir).
     """
     if cfg.pricing.mode.upper() == "PTF":
         return ptf_min / 1000.0          # MWh -> kWh

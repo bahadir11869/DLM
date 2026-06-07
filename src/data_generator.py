@@ -89,6 +89,25 @@ def build_fleet(cfg: SimConfig) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Ortak GUNLUK TALEP/MEVSIM faktoru (A7: PTF-talep korelasyonu + mevsimsellik)
+# --------------------------------------------------------------------------- #
+def daily_demand_factor(cfg: SimConfig) -> np.ndarray:
+    """
+    Gunluk ortak talep/mevsim carpani (days,). HEM baz yuk HEM PTF bu sinyalle
+    olceklenir; boylece yuksek-talep gunlerinde baz yuk de PTF de yukselir
+    (gercek dunyadaki TALEP-FIYAT KORELASYONU). Yavas sinus = mevsimsel drift
+    (sim penceresi boyunca ~1 dongu), uzerine gunluk hava gurultusu.
+    Deterministiktir (cfg.seed); iki uretici ayni diziyi kullanir.
+    """
+    days = cfg.days
+    d = np.arange(days)
+    season = 0.12 * np.sin(2 * np.pi * d / max(days, 1))     # mevsimsel yavas drift
+    rng = np.random.default_rng(cfg.seed + 333)
+    weather = rng.normal(0.0, 0.07, size=days)               # gunluk hava/talep sapmasi
+    return np.clip(1.0 + season + weather, 0.70, 1.35)
+
+
+# --------------------------------------------------------------------------- #
 # 3) Tesis BAZ YUK profili (tepe ≈ %70 trafo)
 # --------------------------------------------------------------------------- #
 def generate_base_load(cfg: SimConfig) -> np.ndarray:
@@ -139,9 +158,13 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
     # Sablonu [0,1]'e olcekle, sonra tepe = peak olacak sekilde carp.
     shape = shape / shape.max()
     base_frac = shape * peak
-    # Gece tabani sifirlanmasin
-    base_frac = np.clip(base_frac, 0.12 * peak / peak * 0.18, peak)
+    # Gece tabani sifirlanmasin (A3: anlamsiz cift-clip satiri kaldirildi)
     base_frac = np.clip(base_frac, 0.15, peak)
+
+    # A7: ortak gunluk talep/mevsim faktoru (PTF ile korelasyon). Gunluk olcekle,
+    # sonra tepeyi peak ile sinirla (baz yuk trafoyu tek basina asmasin).
+    df = daily_demand_factor(cfg)
+    base_frac = base_frac * df[day_of_sim]
 
     noise = rng.normal(0.0, 0.010, size=T)
     base_frac = np.clip(base_frac + noise, 0.10, peak + 0.02)
@@ -197,10 +220,13 @@ def generate_market_prices(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray]:
     )
 
     # ---- Gunluk degiskenlik (hava/mevsim/talep) ----
-    day_level = np.clip(rng.normal(1.0, 0.22, size=days), 0.55, 1.7)  # baz seviye carpani
+    # A7: ortak TALEP/MEVSIM faktoru ile olcekle -> baz yuk ile PTF KORELELI olur
+    # (yuksek-talep/mevsim gunlerinde fiyat da yuksek). Uzerine bagimsiz gurultu.
+    demand_factor = daily_demand_factor(cfg)
+    day_level = np.clip(demand_factor * rng.normal(1.0, 0.06, size=days), 0.5, 1.7)
     weekday = np.arange(days) % 7
     day_level = day_level * np.where(weekday >= 5, 0.90, 1.0)         # haftasonu ucuz
-    peak_daily = np.clip(rng.normal(1.0, 0.15, size=days), 0.6, 1.25)  # aksam tepe carpani
+    peak_daily = np.clip(demand_factor * rng.normal(1.0, 0.08, size=days), 0.6, 1.4)  # aksam tepe
     # solar derinligi: 2026'da cogu gun yuksek-solar; bazen bulutlu (dusuk).
     solar_depth = np.clip(
         rng.beta(2.4, 1.3, size=days) * (pc.ptf_solar_max - pc.ptf_solar_min)
@@ -219,6 +245,9 @@ def generate_market_prices(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray]:
     ptf_hourly = np.clip(ptf_hourly, pc.ptf_floor, pc.ptf_cap)
 
     # ---- SMF: dengesizlik yonune gore PTF etrafinda sapar ----
+    # NOT (A6): SMF yalnizca REFERANS/bilgi amaclidir; maliyet hesabi PTF (veya
+    # 3-zamanli tarife) uzerinden yapilir. SMF, dengesizlik maliyeti modeline
+    # dahil DEGILDIR (dengeden sorumlu taraf degiliz varsayimi).
     imbalance = rng.normal(0.0, 1.0, size=(days, 24))
     smf_hourly = ptf_hourly + pc.smf_spread * np.tanh(imbalance)
     smf_hourly = np.clip(smf_hourly, pc.ptf_floor, pc.ptf_cap + pc.smf_spread)

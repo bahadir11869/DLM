@@ -62,6 +62,11 @@ class StationConfig:
     # KESIN RAMPA HIZI KISITI:  |dP_total/dt| <= 60 kW / dakika.
     ramp_kw_per_min: float = 60.0
 
+    # SARJ VERIMI (A4): sebekeden cekilen gucun bataryaya giren orani. DC hizli
+    # sarjda AC/DC donusum + isil kayiplar ~%6-10'dur. Sebeke (trafo+fatura) gucu
+    # = batarya gucu / verim. Yani fatura ve trafo yuku bataryaya gireninden buyuktur.
+    charge_efficiency: float = 0.92
+
     # SABIT SARJ BITIS KURALI: tum araclar %80 SoC'de biter.
     target_soc: float = 0.80
 
