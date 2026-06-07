@@ -422,15 +422,17 @@ with tabB:
         axs.grid(alpha=0.25); axs.legend(fontsize=9); figs.tight_layout(); st.pyplot(figs); plt.close(figs)
 
     with st.expander("🚗 Arac Bazli Mikro Karsilastirma Tablosu", expanded=True):
-        st.caption("Her arac icin SOH dususu, toplam sarj suresi ve EN COK uzatilan "
-                   "tekil oturum (dakika + %).")
+        st.caption("Her arac icin SOH dususu, toplam sarj suresi, EN KÖTÜ tekil oturumun "
+                   "MUTLAK uzamasi (dk) ve TOPLAM surenin yuzde uzamasi (Σopt/Σnaive). "
+                   "Yuzde, toplam-bazlidir (tekil-oturum yuzdesi hizli passenger araclarda "
+                   "yaniltici biçimde sisiyordu).")
         st.dataframe(
             soh["table"].style.format({
                 "SOH Dususu Algoritmali (%)": "{:.4f}", "SOH Dususu Algoritmasiz (%)": "{:.4f}",
                 "SOH Korunan (puan)": "{:.4f}",
                 "Toplam Sarj Suresi Algoritmali (dk)": "{:,.0f}",
                 "Toplam Sarj Suresi Algoritmasiz (dk)": "{:,.0f}",
-                "Maks Sarj Uzatma (dk)": "{:.0f}", "Maks Sarj Gecikmesi (%)": "{:.1f}",
+                "Maks Sarj Uzatma (dk)": "{:.0f}", "Toplam Sure Uzamasi (%)": "{:.1f}",
                 "Korunan Batarya Bedeli (TL)": "{:,.0f}",
             }), use_container_width=True, hide_index=True, height=430)
 

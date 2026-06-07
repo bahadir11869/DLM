@@ -159,6 +159,7 @@ def simulate(
     hw = s["dc_max"].to_numpy(np.float64)
     arr = s["arr_global"].to_numpy(np.int64)
     dep = s["dep_global"].to_numpy(np.int64)
+    eneed = s["energy_need_kwh"].to_numpy(np.float64)   # oturum toplam enerji ihtiyaci (kWh)
     soc = s["arrival_soc"].to_numpy(np.float64).copy()
 
     delivered = np.zeros(n)
@@ -239,12 +240,24 @@ def simulate(
         hw_a = np.minimum(hw[veh], sock_cap[occ])          # arac VE soket limiti
         energy_rem = np.maximum(0.0, (target - soc_a) * cap_a)
 
-        # ACILIYET GUCU (deadline'a yetisme): aracin %80'e ulasmasi icin gereken
+        # S-KATI EFEKTIF DEADLINE (madde 3 - sure/yuzde tavani):
+        # Aracin sarj suresini, tahmini TAM-GUC (naive) suresinin EN FAZLA S katiyla
+        # sinirla. Boylece "gecikme yuzdesi" ~ (S-1)x100 ile sinirli kalir; algoritma
+        # trafo bos olsa bile gucu sonsuza kadar yayip sureyi 4-5 katina cikaramaz.
+        #   t_naive ≈ enerji / (min(dc,soket)*0.85)   (taper dahil yaklasik tam-guc)
+        #   eff_dep = baslangic + S * t_naive   (gercek cikistan once)
+        avg_full_pow = np.minimum(hw[veh], sock_cap[occ]) * 0.85
+        t_naive_min = eneed[veh] / np.maximum(avg_full_pow, 1e-9) / dt   # dakika
+        sm = np.where(start_min[veh] >= 0, start_min[veh], t)
+        eff_dep = np.minimum(dep[veh], sm + np.ceil(stretch * t_naive_min)).astype(np.int64)
+        eff_dep = np.maximum(eff_dep, t + 1)
+
+        # ACILIYET GUCU (eff_dep'e yetisme): aracin %80'e ulasmasi icin gereken
         # asgari guc. ALPHA (sarj suresi onceligi) bu pencereyi sikistirir:
         #   safety = 0.85 (alpha=0, rahat) ... 0.50 (alpha=1, erken bitir)
         # Kucuk pencere -> daha yuksek aciliyet gucu -> daha hizli sarj.
         safety = 0.85 - 0.35 * weights.alpha
-        time_left = np.maximum(dep[veh] - t, 1)
+        time_left = np.maximum(eff_dep - t, 1)
         time_left_eff = np.maximum(safety * time_left, 1.0)
         p_need = energy_rem / (time_left_eff * dt)
 
@@ -312,7 +325,7 @@ def simulate(
             #                  + GAMMA*1.5*rel_i    (pencere ici ucuz dakikaya bindirir)
             #    GAMMA arttikca opsiyonel guc, pencere icindeki pahali dakikalardan
             #    UCUZ dakikalara kaydirilir -> enerji maliyeti DUSER; tamamlanma ~sabit.
-            dep_v = np.minimum(dep[veh], T)
+            dep_v = np.minimum(eff_dep, T)        # fiyat penceresi de S-kati ile sinirli
             win = np.maximum(dep_v - t, 1)
             future_mean = (cumprice[dep_v] - cumprice[t]) / win
             rel = (future_mean - price_tl_kwh[t]) / prange
@@ -348,7 +361,11 @@ def simulate(
             # kisiti) tabana inilemezse oncelik agirligina gore tahsis edilir.
             g_sum = float(p_urgent.sum())
             if T_t <= g_sum + 1e-9:
-                alloc = _waterfill(T_t, pmax, w)
+                # Tavan dar (contention): garantili tabani TABANA ORANTILI dagit ki
+                # hicbir arac disproporsiyonel ac kalmasin -> uzatma yuzdeleri TEKDUZE
+                # ve sinirli kalir (oncelik agirligiyla dagitim birkac araci asiri
+                # yavaslatip %600'lere cikariyordu).
+                alloc = _waterfill(T_t, pmax, p_urgent)
             else:
                 extra = _waterfill(T_t - g_sum, pmax - p_urgent, w)
                 alloc = p_urgent + extra

@@ -204,18 +204,22 @@ def soh_analysis(cfg: SimConfig, fleet: pd.DataFrame,
     dur_opt = total_duration(sess_opt).reindex(vids).fillna(0.0).values
     dur_naive = total_duration(sess_naive).reindex(vids).fillna(0.0).values
 
-    # Maksimum sarj gecikme yuzdesi (opt vs naive, ayni session_id eslesir)
+    # Sarj suresi uzamasi (opt vs naive). Iki metrik:
+    #   1) "Maks Sarj Uzatma (dk)" : araç başına EN KÖTÜ tekil oturumun MUTLAK uzamasi
+    #      (kac dakika). Mutlak buyukluk - yorumlamasi guvenli.
+    #   2) "Toplam Sure Uzamasi (%)": araç başına TOPLAM sarj suresinin yuzde uzamasi
+    #      (Σopt/Σnaive − 1). TEMSILI metrik. (Eski "tekil oturum %" metrigi, hizli
+    #      sarj olan passenger araclarda minik naive tabana bolundugu icin %500-600
+    #      gibi YANILTICI degerler uretiyordu; toplam-bazli oran gercekci ve sinirli.)
     m = sess_opt[["session_id", "vehicle_id", "charge_duration_min"]].merge(
         sess_naive[["session_id", "charge_duration_min"]],
         on="session_id", suffixes=("_opt", "_naive"),
     )
     m = m[(m["charge_duration_min_naive"] > 0) & m["charge_duration_min_opt"].notna()]
-    # Session bazinda uzatma (dakika): opt suresi - naive suresi
     m["delay_min"] = m["charge_duration_min_opt"] - m["charge_duration_min_naive"]
-    m["delay_pct"] = m["delay_min"] / m["charge_duration_min_naive"] * 100.0
-    # Her arac icin EN COK uzatilan tekil oturum (dakika ve %)
     max_delay_min = m.groupby("vehicle_id")["delay_min"].max().reindex(vids).fillna(0.0).values
-    max_delay_pct = m.groupby("vehicle_id")["delay_pct"].max().reindex(vids).fillna(0.0).values
+    with np.errstate(divide="ignore", invalid="ignore"):
+        total_stretch_pct = np.where(dur_naive > 0, (dur_opt / np.maximum(dur_naive, 1e-9) - 1.0) * 100.0, 0.0)
 
     table = pd.DataFrame({
         "Arac ID": vids,
@@ -226,7 +230,7 @@ def soh_analysis(cfg: SimConfig, fleet: pd.DataFrame,
         "Toplam Sarj Suresi Algoritmali (dk)": dur_opt,
         "Toplam Sarj Suresi Algoritmasiz (dk)": dur_naive,
         "Maks Sarj Uzatma (dk)": max_delay_min,
-        "Maks Sarj Gecikmesi (%)": max_delay_pct,
+        "Toplam Sure Uzamasi (%)": total_stretch_pct,
         "Korunan Batarya Bedeli (TL)": (final_naive - final_opt) * pack_cost,
     })
 
