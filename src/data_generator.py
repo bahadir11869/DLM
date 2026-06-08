@@ -18,6 +18,7 @@ Veriler data/ klasorune Parquet (yoksa CSV) olarak kaydedilir.
 from __future__ import annotations
 
 import os
+import datetime as _dt
 from typing import Tuple
 
 import numpy as np
@@ -108,12 +109,113 @@ def daily_demand_factor(cfg: SimConfig) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# 3) Tesis BAZ YUK profili (tepe ≈ %70 trafo)
+# 2b) GERCEK ANKARA ORTAM SICAKLIGI (madde 1) - termal model girdisi
+# --------------------------------------------------------------------------- #
+def _sim_start_date(cfg: SimConfig) -> _dt.date:
+    """Simulasyon baslangic tarihi (EN KOTU senaryo: Mayis basi)."""
+    th = cfg.thermal
+    # Yil onemsiz (sadece takvim ay/gun kullanilir); arti-yil sarmalanir.
+    return _dt.date(2025, int(th.sim_start_month), int(th.sim_start_day))
+
+
+def ambient_series(cfg: SimConfig) -> np.ndarray:
+    """
+    Simulasyon penceresi icin dakika bazli GERCEK Ankara ortam sicakligi θa(t) (°C).
+
+    - Baslangic: Mayis basi (EN KOTU senaryo; 100 gun -> ~9 Agustos, en sicak bant).
+    - Her gun, takvim ayinin Ankara ORTALAMA gunluk sicakligi alinir; aylar arasi
+      yumusak gecis icin komsu ayla lineer harmanlama yapilir.
+    - Gun-ici: θa = gun_ort + ay_genligi · sin(2π(saat−9)/24)  -> tepe ~15:00.
+    - Uzerine kucuk, DETERMINISTIK gunluk hava sapmasi (cfg.seed).
+    Donus: shape (days*1440,)
+    """
+    th = cfg.thermal
+    days = cfg.days
+    T = days * MINUTES_PER_DAY
+    start = _sim_start_date(cfg)
+    means = np.asarray(th.ankara_monthly_mean_c, dtype=np.float64)
+    amps = np.asarray(th.ankara_monthly_amp_c, dtype=np.float64)
+
+    rng = np.random.default_rng(cfg.seed + 4242)
+    day_noise = rng.normal(0.0, th.ambient_daily_noise_c, size=days)
+
+    day_mean = np.empty(days)
+    day_amp = np.empty(days)
+    for d in range(days):
+        cur = start + _dt.timedelta(days=d)
+        m = cur.month - 1                          # 0-index ay
+        # ayin gunune gore komsu ayla lineer harmanlama (yumusak mevsim gecisi)
+        dim = _days_in_month(cur.year, cur.month)
+        frac = (cur.day - 1) / max(dim - 1, 1)     # 0..1 ay icinde konum
+        nxt = (m + 1) % 12
+        prv = (m - 1) % 12
+        if frac < 0.5:                             # ayin ilk yarisi: onceki aya dogru
+            w = 0.5 - frac
+            mean = means[m] * (1 - w) + means[prv] * w
+            amp = amps[m] * (1 - w) + amps[prv] * w
+        else:                                      # ikinci yari: sonraki aya dogru
+            w = frac - 0.5
+            mean = means[m] * (1 - w) + means[nxt] * w
+            amp = amps[m] * (1 - w) + amps[nxt] * w
+        day_mean[d] = mean + day_noise[d]
+        day_amp[d] = amp
+
+    minute_idx = np.arange(T)
+    d_of = minute_idx // MINUTES_PER_DAY
+    hour = (minute_idx % MINUTES_PER_DAY) / 60.0
+    intraday = np.sin(2 * np.pi * (hour - 9.0) / 24.0)         # tepe ~15:00
+    theta_a = day_mean[d_of] + day_amp[d_of] * intraday
+    return theta_a.astype(np.float64)
+
+
+def seasonal_aging_factor(cfg: SimConfig) -> float:
+    """
+    MEVSIMSEL YASLANMA FAKTORU (madde 3 - 30 yil ekstrapolasyonu).
+
+    Simulasyon penceresi EN KOTU (yaz) aylari kapsar; tum yila tasirken kis
+    aylarinin DUSUK ortam sicakligi yaslanmayi ustel olarak azaltir. Faktor:
+        s = <2^(θa_gun/6)>_yil / <2^(θa_gun/6)>_pencere   (< 1)
+    Ankara aylik ortalamalarindan, gun-agirlikli hesaplanir (gun-ici salinim
+    oran icinde buyuk olcude sadelesir; gunluk ortalama yeterli yaklasimdir).
+    """
+    th = cfg.thermal
+    k = th.aging_doubling_k
+    means = np.asarray(th.ankara_monthly_mean_c, dtype=np.float64)
+
+    # Tum yil: her takvim gunu -> ayinin ortalamasi
+    year_means = []
+    for mo in range(1, 13):
+        dim = _days_in_month(2025, mo)
+        year_means.extend([means[mo - 1]] * dim)
+    year_means = np.asarray(year_means, dtype=np.float64)
+    year_metric = float(np.mean(np.power(2.0, year_means / k)))
+
+    # Pencere: simule edilen gunlerin gun-ortalamalari
+    start = _sim_start_date(cfg)
+    win_means = []
+    for d in range(cfg.days):
+        cur = start + _dt.timedelta(days=d)
+        win_means.append(means[cur.month - 1])
+    win_metric = float(np.mean(np.power(2.0, np.asarray(win_means) / k)))
+
+    return year_metric / max(win_metric, 1e-9)
+
+
+def _days_in_month(year: int, month: int) -> int:
+    if month == 12:
+        nxt = _dt.date(year + 1, 1, 1)
+    else:
+        nxt = _dt.date(year, month + 1, 1)
+    return (nxt - _dt.date(year, month, 1)).days
+
+
+# --------------------------------------------------------------------------- #
+# 3) Tesis BAZ YUK profili (tepe ≈ %60 trafo - madde 9)
 # --------------------------------------------------------------------------- #
 def generate_base_load(cfg: SimConfig) -> np.ndarray:
     """
     Tesis baz yuk profili (kW), dakika bazli. Tepe noktasi trafonun
-    base_peak_frac (varsayilan %70 -> ≈1120 kW) seviyesine ulasir.
+    base_peak_frac (varsayilan %60 -> ≈912 kW @ 1520 kW etkin anma) seviyesine ulasir.
 
     - FABRIKA: gunduz operasyon yuksek (vardiyalar), gece dusuk.
     - AVM     : gunduz/aksam yuksek, gece dusuk; hafta sonu daha yuksek.
@@ -167,7 +269,9 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
     base_frac = base_frac * df[day_of_sim]
 
     noise = rng.normal(0.0, 0.010, size=T)
-    base_frac = np.clip(base_frac + noise, 0.10, peak + 0.02)
+    # Madde 9: baz yuk TEPESI trafo anmasinin tam %base_peak_frac'ini (varsayilan
+    # %60) asmaz. Yuksek-talep gunlerinde gunluk faktor tepeyi bu tavanda kirpar.
+    base_frac = np.clip(base_frac + noise, 0.10, peak)
 
     return (base_frac * rated).astype(np.float64)
 

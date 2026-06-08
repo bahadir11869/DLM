@@ -5,15 +5,17 @@ config.py
 Tum simulasyon icin paylasilan sabitler ve yapilandirma nesneleri.
 
 Kapsanan konular:
-  - Donanim: 1600 kVA ana trafo, karisik DC soket parki (200/180/120 kW).
-  - Baz yuk: trafo nominalinin ~%70'ine (≈1120 kW) ulasan tesis profili.
+  - Donanim: 1600 kVA ana trafo (cosφ=0.95 -> 1520 kW etkin), karisik DC soket
+    parki (200/180/120 kW). Cesitlilik (esZamanlilik) faktoru - madde 6.
+  - Baz yuk: trafo etkin anmasinin %60'ina (≈912 kW) ulasan tesis profili (madde 9).
   - Fiyatlandirma: (a) PTF/SMF (EPIAS piyasa) - buyuk fabrika olcegi,
                    (b) 3-zamanli sanayi tarifesi - daha kucuk tesis olcegi.
-  - Optimizasyon kisitlari: ±60 kW ramp, %80 SoC bitis, C-rate (SOH) tavani.
-  - Trafo Termal Omur modeli (IEEE C57.91 benzeri) parametreleri.
+  - Optimizasyon kisitlari: ramp (kurulu gucun %10/dk), %80 SoC bitis, C-rate tavani.
+  - Trafo Termal Omur modeli: IEC 60076-7:2018 (madde 2) + gercek Ankara
+    sicakliklari (madde 1) + 30 yillik omur ekstrapolasyonu (madde 3).
   - Batarya SOH ve finansal (ROI) parametreleri.
 
-Tum degerler gercek dunya verilerine yakin secilmistir.
+Tum degerler gercek dunya verilerine ve ilgili standartlara yakin secilmistir.
 """
 
 from __future__ import annotations
@@ -37,35 +39,61 @@ DAYS_DEFAULT: int = 100               # 100 gun x 1440 dakika
 class StationConfig:
     """Sarj istasyonu donanim yapilandirmasi."""
 
-    # Ana trafo: 1600 kVA. Basitlik icin guc faktoru 1.0 alinir (kVA ≈ kW),
-    # boylece baz yuk zirvesi 0.70 * 1600 = 1120 kW olarak ifade edilir.
+    # Ana trafo: 1600 kVA gorunur guc.
     transformer_kva: float = 1600.0
-    power_factor: float = 1.0
 
-    # Baz yuk, trafonun bu oranina kadar cikar (ispat icin yuksek tutulur).
-    base_peak_frac: float = 0.70          # ≈ 1120 kW tepe
+    # ORTALAMA GUC FAKTORU (madde 6): trafo etkin (aktif) gucu = kVA x cosφ.
+    # Modern DC hizli sarj cihazlari aktif PFC ile cosφ≈0.98-0.99 calisir; tesis
+    # baz yuku (motor/aydinlatma/HVAC) ile birlikte TESIS ORTALAMA guc faktoru
+    # tipik olarak ~0.95'tir (EPDK reaktif-ceza esigi cosφ≥0.90'in ustunde tutulur).
+    # rated_kw = 1600 x 0.95 = 1520 kW etkin guc.
+    power_factor: float = 0.95
+
+    # BAZ YUK TEPE ORANI (madde 9): tesis baz yuk tepesi trafonun bu oranina
+    # ulasir. %60 -> 0.60 x 1520 = 912 kW tepe. Cesitlilikli istasyon talebi
+    # (~%20-30) eklenince bile toplam trafo anmasinin altinda kalir (overload yok).
+    base_peak_frac: float = 0.60          # ≈ 912 kW tepe
 
     # Optimize stratejinin trafoyu yuklemesine izin verdigi ust sinir (p.u.).
-    # Optimize sarji, baz+sarj toplamini bu sinirin altinda tutar (peak-shaving).
-    # Bodoslama (naive) bu siniri YOK sayar -> trafo asiri yuklenir (termal yaslanma).
     opt_max_loading_pu: float = 1.00      # optimize: trafoyu asma
 
-    # KARISIK DC ALTYAPI: 1600 kVA'yi mantikli dolduran 6-8 soket.
-    # KURULUM KURALI: toplam istasyon gucu, trafonun GECE headroom'unu
-    # (rated - min(baz yuk)) gecmemelidir. Boylece tum istasyonlar gece ayni anda
-    # tam guc calisabilir; GUNDUZ baz yuk yuksekken algoritma sarji kisarak trafoyu
-    # korur. (Bodoslama kismadigi icin gunduz trafoyu asar -> overload.)
+    # KARISIK DC ALTYAPI (madde 9): istasyon sayilari, CESITLILIK (esZamanlilik)
+    # FAKTORU devredeyken algoritma-oncesi toplam istasyon talebinin trafo
+    # anmasinin %20-%30 araliginda kalmasini saglayacak sekilde secilir.
+    #   kurulu guc = 2x200 + 1x180 + 1x120 = 700 kW
+    #   cesitlilikli talep = 700 x 0.60 = 420 kW ≈ trafo anmasinin (1520) %27.6'si
+    # Baz tepe (%60) + cesitlilikli istasyon (%27.6) = %87.6 < %100 -> overload YOK.
     n_socket_200: int = 2     # 2 x 200 kW
-    n_socket_180: int = 3     # 3 x 180 kW
-    n_socket_120: int = 2     # 2 x 120 kW   (toplam 7 soket, 1300 kW kurulu)
+    n_socket_180: int = 1     # 1 x 180 kW
+    n_socket_120: int = 1     # 1 x 120 kW   (toplam 4 soket, 700 kW kurulu)
 
-    # KESIN RAMPA HIZI KISITI:  |dP_total/dt| <= 60 kW / dakika.
-    ramp_kw_per_min: float = 60.0
+    # CESITLILIK / ESZAMANLILIK (DIVERSITY) FAKTORU (madde 6):
+    # IEC 60364-7-722: bir Yuk Yonetim Sistemi (LMS) YOKSA tasarim cesitlilik
+    # faktoru 1 alinir (tum noktalar ayni anda tam guc cekebilir). Pratik TALEP
+    # TAHMININDE ise, bir DC sarj kumesinin gercek esZamanli talebi kuruludan
+    # dusuktur (varislerin/taper'in dagilimi). Bu modelde:
+    #   - ALGORITMA-ONCESI (naive, LMS yok): esZamanli sarj talebi
+    #     diversity_factor x kurulu_guc ile sinirlanir (gercekci talep tahmini).
+    #   - ALGORITMA (optimize) IEC 60364-7-722'deki LMS'in karsiligidir; talebi
+    #     aktif olarak trafo headroom'u icinde yonetir.
+    diversity_factor: float = 0.60
 
-    # SARJ VERIMI (A4): sebekeden cekilen gucun bataryaya giren orani. DC hizli
-    # sarjda AC/DC donusum + isil kayiplar ~%6-10'dur. Sebeke (trafo+fatura) gucu
-    # = batarya gucu / verim. Yani fatura ve trafo yuku bataryaya gireninden buyuktur.
-    charge_efficiency: float = 0.92
+    # RAMPA HIZI KISITI (madde 4): EV sarj cihazlari icin "kW/dk" cinsinden ZORUNLU
+    # bir standart YOKTUR; cihazin kendisi ISO 15118 / IEC 61851 ile saniyeler
+    # icinde rampa yapabilir. Sinir, SAHA EMS'inin GUC KALITESI (gerilim
+    # dalgalanmasi / flicker) icin koydugu bir yumusatma tercihidir
+    # (IEC 61000-3-3 / IEC 61000-3-11). Bu nedenle ramp, KONTROL EDILEBILIR sarj
+    # gucunun bir YUZDESI olarak ifade edilir (mutlak kW yerine olceklenebilir):
+    #   ramp_kw/dk = ramp_frac_per_min x kurulu_istasyon_gucu  (alt taban ile)
+    # %10/dk -> 700 kW kuruluda 70 kW/dk (eski sabit ~60 kW/dk ile uyumlu mertebede).
+    ramp_frac_per_min: float = 0.10
+    ramp_floor_kw_per_min: float = 30.0   # cok kucuk kurulumlarda alt taban
+
+    # SARJ VERIMI (madde 7): sebekeden cekilen gucun bataryaya giren orani.
+    # DC hizli sarj zinciri (AC/DC donusum + isil + yardimci) tipik verimi
+    # ~%92-95'tir; ORTALAMA %93 alinir. Sebeke (trafo+fatura) gucu = batarya
+    # gucu / verim; yani fatura ve trafo yuku bataryaya gireninden buyuktur.
+    charge_efficiency: float = 0.93
 
     # SABIT SARJ BITIS KURALI: tum araclar %80 SoC'de biter.
     target_soc: float = 0.80
@@ -99,6 +127,25 @@ class StationConfig:
     @property
     def n_sockets(self) -> int:
         return self.n_socket_120 + self.n_socket_180 + self.n_socket_200
+
+    @property
+    def installed_kw(self) -> float:
+        """Toplam kurulu istasyon (soket) gucu (kW)."""
+        return float(sum(self.socket_list()))
+
+    @property
+    def diversified_demand_kw(self) -> float:
+        """Cesitlilik faktorlu (esZamanli) istasyon talebi (kW) - madde 6/9."""
+        return self.installed_kw * self.diversity_factor
+
+    @property
+    def ramp_kw_per_min(self) -> float:
+        """
+        Rampa hizi (kW/dakika) - madde 4. Kontrol edilebilir kurulu sarj gucunun
+        ramp_frac_per_min yuzdesi; cok kucuk kurulumlar icin ramp_floor_kw_per_min
+        alt tabani uygulanir. Mutlak sabit yerine olceklenebilir tanim.
+        """
+        return max(self.ramp_floor_kw_per_min, self.installed_kw * self.ramp_frac_per_min)
 
 
 # --------------------------------------------------------------------------- #
@@ -165,41 +212,82 @@ class PricingConfig:
 
 
 # --------------------------------------------------------------------------- #
-# Trafo Termal Omur modeli (IEEE C57.91 benzeri)
+# Trafo Termal Omur modeli (IEC 60076-7:2018) - madde 2
 # --------------------------------------------------------------------------- #
 @dataclass
 class ThermalConfig:
     """
-    IEEE C57.91 benzeri sicak-nokta (hot-spot) sicakligi ve omur tuketimi.
+    IEC 60076-7:2018 "Loading guide for oil-immersed power transformers" sicak-nokta
+    (hot-spot) sicakligi ve omur tuketimi modeli (fark-denklemi cozumu, madde 8.2.2).
 
-    Buyukler:
-      dtheta_to_rated : anma yukunde ust-yag sicaklik artisi (°C)
-      dtheta_hs_rated : anma yukunde sicak-nokta'nin ust-yaga gore artisi (°C)
-      R_ratio         : yuk kaybi / bos calisma kaybi orani
-      n_exp, m_exp    : yag ve sargi ustelleri (ONAN icin ~0.8)
-      tau_to_min      : ust-yag termal zaman sabiti (dakika)
-      hs_reference_c  : referans sicak-nokta (110°C termal-iyilestirilmis kagit)
-      normal_life_hours: referans sicaklikta normal yalitim omru (saat)
+    SICAK-NOKTA (FARK DENKLEMI) MODELI:
+      K(t)        = (baz+sarj)/S_anma                              (p.u. yuklenme)
+      Δθo,ult     = Δθor · ((1 + R·K²)/(1 + R))^x                  (ust-yag nihai artisi)
+      Δθo[t]      = Δθo[t-1] + (Δt/(k11·τo))·(Δθo,ult − Δθo[t-1])  (ust-yag, yag ataleti)
+      Δθh1[t]     = Δθh1[t-1] + (Δt/(k22·τw))·(k21·Δθhr·K^y − Δθh1[t-1])
+      Δθh2[t]     = Δθh2[t-1] + (Δt/((1/k22)·τo))·((k21−1)·Δθhr·K^y − Δθh2[t-1])
+      Δθh        = Δθh1 − Δθh2                                     (sicak-nokta gradyani)
+      θh[t]       = θa(t) + Δθo[t] + Δθh[t]                        (sicak-nokta sicakligi)
+
+    BAGIL YASLANMA HIZI (madde 6.3, normal/termal-iyilestirilMEMIS kraft kagit, 98°C ref):
+      V(t)        = 2^((θh(t) − 98)/6)
+      Tuketilen omur (saat) = Σ V(t)·Δt  (98°C referansta V=1, "normal" omur hizi)
+
+    Parametreler IEC 60076-7:2018 Tablo (orta/buyuk guc trafosu, ONAN) onerilen
+    degerleridir.
     """
-    dtheta_to_rated: float = 55.0
-    dtheta_hs_rated: float = 25.0    # 55 + 25 = 80°C sicak-nokta artisi (anma)
-    R_ratio: float = 8.0
-    n_exp: float = 0.8
-    m_exp: float = 0.8
-    tau_to_min: float = 180.0
-    hs_reference_c: float = 110.0
-    normal_life_hours: float = 180000.0   # ≈ 20.55 yil (termal yalitim referansi)
+    # ---- IEC fark-denklemi termal model sabitleri (orta guc ONAN) ----
+    x_oil_exp: float = 0.8        # yag ustsel (oil exponent)
+    y_wind_exp: float = 1.3       # sargi ustsel (winding exponent)
+    R_ratio: float = 6.0          # yuk kaybi / bos calisma kaybi orani
+    k11: float = 0.5              # termal model sabiti
+    k21: float = 2.0              # termal model sabiti
+    k22: float = 2.0              # termal model sabiti
+    tau_o_min: float = 210.0      # ortalama yag zaman sabiti (dakika)
+    tau_w_min: float = 10.0       # sargi (hot-spot) zaman sabiti (dakika)
+
+    # ---- Anma artislari (rated rises) ----
+    # Anma yukunde (K=1) ust-yag artisi ve sicak-nokta-ustyag gradyani. Toplam
+    # 52 + 26 = 78 K sicak-nokta artisi; 20°C ortamda θh,anma = 98°C (IEC normal
+    # yalitim referans tasarimi -> anmada V=1).
+    dtheta_or: float = 52.0       # Δθor: anma ust-yag artisi (K)
+    dtheta_hr: float = 26.0       # Δθhr = H·gr: anma sicak-nokta-ustyag gradyani (K)
+
+    # ---- Bagil yaslanma / omur ----
+    hs_reference_c: float = 98.0          # IEC normal kagit referansi (V=1)
+    aging_base: float = 2.0               # V = 2^((θh−98)/6)
+    aging_doubling_k: float = 6.0         # her +6°C'de yaslanma ikiye katlanir
+    normal_life_hours: float = 180000.0   # 98°C referansta normal yalitim omru (≈20.5 yil)
 
     # FIZIKSEL TASARIM OMRU TAVANI (madde 2):
-    # Dusuk yuklenmede termal yaslanma ihmal edilebilir hale gelir ve IEEE LoL
-    # modelinin "esdeger omru" yuzlerce/binlerce yila cikar (FIZIKSEL DEGIL).
-    # Gercekte trafo omru nem, busing, OLTC, mekanik vb. nedenlerle tasarim
-    # omruyle sinirlidir; esdeger omur bu tavanla kirpilir.
+    # Dusuk yuklenmede termal yaslanma ihmal edilebilir; IEC LoL "esdeger omru"
+    # fiziksel olmayan yuzlerce yila cikar. Esdeger omur, nem/busing/OLTC/mekanik
+    # etkenlerle sinirli fiziksel tasarim omruyle (30 yil) kirpilir.
     design_life_years: float = 30.0
 
-    # Ortam sicakligi (gun-ici sinuzoidal profil, °C)
-    ambient_mean_c: float = 28.0
-    ambient_amp_c: float = 7.0
+    # 30-YILLIK OMUR TUKETIMI EKSTRAPOLASYONU (madde 3):
+    # Simulasyon EN KOTU 100 gunu (Mayis-Agustos, Ankara) kapsar. 30 yillik omur
+    # tuketimi, bu pencerenin yaslanma hizi MEVSIMSEL DUZELTME ile yila tasinir
+    # (kis aylarinda θa dusuk -> V ustel olarak cok kuculur). Yaklasim:
+    #   yillik_LoL ≈ pencere_LoL × (365/sim_gun) × mevsim_faktoru
+    #   mevsim_faktoru = <2^(θa_gun/6)>_yil / <2^(θa_gun/6)>_pencere   (<1)
+    # mevsim_faktoru, Ankara aylik ortalama sicakliklarindan hesaplanir.
+    extrapolation_years: float = 30.0
+
+    # ---- Gercek ANKARA ortam sicakligi (madde 1) ----
+    # Simulasyon EN KOTU senaryo icin MAYIS basindan baslar (1 numarali ay=Ocak).
+    sim_start_month: int = 5      # Mayis
+    sim_start_day: int = 1
+    # Ankara aylik ORTALAMA gunluk sicaklik (°C) ve gunluk salinim genligi (yari
+    # tepe-dip), Ocak..Aralik. (Kaynak: iklim normalleri, climate-data.org /
+    # WeatherSpark.) Termal model bu serileri gun-ici sinuzoidal profile yayar.
+    ankara_monthly_mean_c: tuple = (
+        0.5, 2.0, 6.0, 11.0, 15.7, 20.0, 23.5, 23.5, 18.5, 12.5, 6.5, 2.0,
+    )
+    ankara_monthly_amp_c: tuple = (
+        5.0, 6.0, 7.0, 7.0, 7.0, 7.2, 7.5, 7.5, 7.5, 7.0, 6.0, 5.0,
+    )
+    ambient_daily_noise_c: float = 1.5    # gunluk hava sapmasi (deterministik)
 
     # Trafo yenileme maliyeti (1600 kVA OG trafo, montaj dahil, TL)
     transformer_cost_tl: float = 4_000_000.0
@@ -215,7 +303,8 @@ class FinancialConfig:
     # GUC / DEMAND CHARGE ve GUC ASIM CEZASI (EPDK mevzuati)
     # ------------------------------------------------------------------
     # Sozlesme gucu (kW): dagitim sirketiyle anlasilan azami cekis gucu.
-    contracted_demand_kw: float = 1400.0
+    # Trafo etkin anmasinin (1520 kW @ cosφ=0.95) altinda; ekonomik tepe esigi.
+    contracted_demand_kw: float = 1300.0
     # Aylik guc/demand bedeli (TL/kW/ay).
     demand_charge_tl_per_kw: float = 90.0
     # GUC ASIM BEDELI: EPDK "Elektrik Piyasasi Tarifeler Yonetmeligi" uyarinca

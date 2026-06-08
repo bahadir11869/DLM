@@ -5,21 +5,27 @@ optimizer.py
 Gercek zamanli, dakika bazli, cok-amacli (Multi-Objective) dinamik yuk dagilimi.
 
 Iki strateji:
-  1) "optimized" : alpha/beta/gamma agirlikli, ±60 kW ramp-limitli, C-rate (SOH)
-                   korumali, fiyat-bilincli ve TRAFO-KORUMALI akilli dagitim.
-                   Toplam yuku (baz+sarj) trafo anma gucunun ustune cikarmaz
-                   -> peak-shaving + termal koruma.
-  2) "naive"     : "klasik bodoslama" - her arac sokete takildigi an mumkun olan
-                   maksimum gucu ceker; SADECE soket donanimiyla sinirlidir.
-                   Trafo limitini, ramp'i, C-rate'i ve fiyati YOK sayar
-                   -> trafo asiri yuklenir (termal yaslanma), batarya hizli yipranir.
+  1) "optimized" : alpha/beta/gamma agirlikli, ramp-limitli (kurulu gucun %10/dk -
+                   madde 4), C-rate (SOH) korumali, fiyat-bilincli ve TRAFO-KORUMALI
+                   akilli dagitim = IEC 60364-7-722 anlamindaki Yuk Yonetim Sistemi
+                   (LMS). Toplam yuku (baz+sarj) trafo/sozlesme gucunun ustune
+                   cikarmaz -> peak-shaving + termal koruma + maliyet.
+  2) "naive"     : "klasik bodoslama" - aktif yuk yonetimi YOK. Araclar gelir gelmez
+                   sarj olur; ramp/fiyat/C-rate yok. Tek gercekci kisit, elektrik
+                   mevzuatindaki CESITLILIK (esZamanlilik) faktorudur: esZamanli
+                   istasyon talebi diversity_factor × kurulu_guc ile sinirlidir
+                   (madde 6/9). Istasyonlar bu nedenle DOGRU boyutlandirildiginda
+                   naive BILE trafoyu asmaz; DLM'in faydasi peak-shaving, maliyet,
+                   termal omur ve SOH'tur.
 
 ==========================================================================
- ±60 kW RAMPA LIMITININ MATEMATIGI  (Ramp Rate Limit, dP/dt)
+ RAMPA LIMITININ MATEMATIGI  (Ramp Rate Limit, dP/dt) - madde 4
 ==========================================================================
-Trafoya binen toplam sarj gucu P_total(t) ani degisemez:
+Toplam sarj gucu P_total(t) ani degisemez (saha EMS guc-kalitesi yumusatmasi;
+EV sarj cihazi kendisi ISO 15118/IEC 61851 ile saniyeler icinde ramp yapar, sinir
+flicker/gerilim dalgalanmasi icindir - IEC 61000-3-3/-11):
 
-        |P_total(t) - P_total(t-1)|  <=  R        (R = 60 kW / dakika)
+        |P_total(t) - P_total(t-1)|  <=  R        (R = ramp_frac × kurulu_guc / dk)
 
 Her t dakikasinda HARD CONSTRAINT olarak:
 
@@ -134,12 +140,19 @@ def simulate(
     T = len(base_load)
     dt = HOURS_PER_MINUTE
     target = st.target_soc
-    ramp = st.ramp_kw_per_min
+    ramp = st.ramp_kw_per_min            # madde 4: kurulu gucun %'sinden (property)
     stretch = max(st.max_stretch_factor, 1.0)   # madde 3: maks sarj uzatma katsayisi
-    rated = st.rated_kw
+    rated = st.rated_kw                  # madde 6: kVA × cosφ (etkin kW)
     max_load = st.opt_max_loading_pu
-    eff = float(min(max(st.charge_efficiency, 0.5), 1.0))  # A4: sebeke->batarya verimi
+    eff = float(min(max(st.charge_efficiency, 0.5), 1.0))  # madde 7: sebeke->batarya verimi
     is_opt = (strategy == "optimized")
+
+    # CESITLILIK (ESZAMANLILIK) FAKTORU (madde 6/9): algoritma-oncesi (naive, LMS yok)
+    # esZamanli SEBEKE talebi diversity_factor × kurulu_guc ile sinirlanir. Batarya
+    # tarafi karsilik = grid × verim (charging_out = alloc/eff). Boylece naive tepe
+    # baz_tepe + diversity×kurulu < trafo anmasi -> ALGORITMA ONCESINDE BILE overload yok.
+    div_cap_grid = st.diversity_factor * st.installed_kw
+    div_cap_batt = div_cap_grid * eff
 
     # A1: OPTIMIZE HEDEF TAVANI = min(fiziksel trafo, sozlesme gucu).
     # Ekonomik ceza esigi (sozlesme gucu, 1400) trafo anmasindan (1600) dusukse,
@@ -297,7 +310,8 @@ def simulate(
             # (alloc batarya gucudur; sebeke = alloc/eff). Boylece baz+sarj(sebeke) <= cap_kw.
             C_t = max(0.0, cap_kw - base_load[t]) * eff
         else:
-            # Bodoslama (naive): trafo limiti, sozlesme, ramp ve C-rate YOK -> overload mumkun.
+            # Bodoslama (naive): aktif LMS yok; trafo limiti/sozlesme/ramp/C-rate YOK.
+            # Tek gercekci kisit: CESITLILIK faktorlu esZamanli talep (asagida T_t).
             pmax = p_hard
             C_t = float(pmax.sum())
 
@@ -377,9 +391,11 @@ def simulate(
             T_t = float(np.clip(T_ramp, 0.0, min(C_t, float(pmax.sum()))))
             alloc = _waterfill(T_t, pmax, pmax)
         else:
-            # BODOSLAMA / naive: herkes maksimum (istasyon-limitli),
-            # ramp/fiyat/trafo/C-rate YOK. Paylasim yine tavanlara orantilidir.
-            T_t = float(pmax.sum())
+            # BODOSLAMA / naive: ramp/fiyat/trafo/C-rate YOK. Tek kisit, gercekci
+            # ESZAMANLILIK (cesitlilik) faktorudur (madde 6/9): esZamanli batarya
+            # talebi div_cap_batt (= diversity×kurulu×verim) ile sinirlanir. Bu,
+            # "LMS yok ama tum soketler ayni anda tam guce ulasmaz" demand-tahminidir.
+            T_t = min(float(pmax.sum()), div_cap_batt)
             alloc = _waterfill(T_t, pmax, pmax)
 
         # (f) entegrasyon. alloc = BATARYA tarafi guc (kW); SEBEKE = alloc/eff (A4).

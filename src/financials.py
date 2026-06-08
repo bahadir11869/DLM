@@ -2,15 +2,16 @@
 """
 financials.py
 =============
-PTF/SMF entegrasyonu, Trafo Termal Omur modeli (IEEE C57.91 benzeri),
+PTF/SMF entegrasyonu, Trafo Termal Omur modeli (IEC 60076-7:2018),
 batarya SOH kumulatif analizi ve B2B ROI hesaplamalari.
 
 Ana fonksiyonlar:
-  - build_price_signal()    : PTF (MWh->kWh) veya 3-zamanli tarife -> TL/kWh dizi
-  - thermal_loss_of_life()  : IEEE C57.91 sicak-nokta + omur tuketimi
-  - soh_analysis()          : 100 gun kumulatif SOH (algoritmali vs algoritmasiz)
-  - summarize_costs()       : enerji + demand maliyeti
-  - full_analysis()         : dashboard icin tum KPI'lari toplar
+  - build_price_signal()         : PTF (MWh->kWh) veya 3-zamanli tarife -> TL/kWh dizi
+  - thermal_loss_of_life()       : IEC 60076-7 sicak-nokta + omur tuketimi (gercek ambient)
+  - transformer_life_projection(): 30 yillik omur ekstrapolasyonu + ertelenen maliyet
+  - soh_analysis()               : 100 gun kumulatif SOH (algoritmali vs algoritmasiz)
+  - summarize_costs()            : enerji + demand maliyeti
+  - full_analysis()              : dashboard icin tum KPI'lari toplar
 
 Tum agir hesaplar NumPy ile vektorizedir (termal model ust-yag gecikmesi haric;
 o da O(T) tek-gecisli bir IIR'dir).
@@ -25,6 +26,7 @@ import pandas as pd
 
 from .config import SimConfig, MINUTES_PER_DAY, HOURS_PER_MINUTE
 from .optimizer import SimResult
+from .data_generator import ambient_series, seasonal_aging_factor
 
 
 # --------------------------------------------------------------------------- #
@@ -54,90 +56,155 @@ def build_price_signal(cfg: SimConfig, ptf_min: np.ndarray, smf_min: np.ndarray)
 
 
 # --------------------------------------------------------------------------- #
-# 2) TRAFO TERMAL OMUR MODELI  (IEEE C57.91 benzeri)
+# 2) TRAFO TERMAL OMUR MODELI  (IEC 60076-7:2018) - madde 1, 2, 3
 # --------------------------------------------------------------------------- #
-def thermal_loss_of_life(cfg: SimConfig, facility_kw: np.ndarray) -> Dict[str, object]:
+def thermal_loss_of_life(cfg: SimConfig, facility_kw: np.ndarray,
+                         ambient: np.ndarray = None) -> Dict[str, object]:
     """
-    Trafonun sicak-nokta (hot-spot) sicakligini ve yalitim omru tuketimini hesaplar.
+    Trafonun sicak-nokta (hot-spot) sicakligini ve yalitim omru tuketimini IEC
+    60076-7:2018 FARK-DENKLEMI modeli (madde 8.2.2) ile hesaplar.
 
-    ADIMLAR (IEEE C57.91):
-      K(t)      = S(t) / S_rated                      (per-unit yuklenme)
-      ΔθTO,ult  = ΔθTO,R * ((K^2*R + 1)/(R + 1))^n    (ust-yag nihai artisi)
-      ΔθTO(t)   : ust-yagin gercek artisi, tau_TO zaman sabitli 1. derece gecikme
-                  (oil termal ataleti) -> ΔθTO[t] = ΔθTO[t-1] + (Δt/τ)(ult - ΔθTO[t-1])
-      ΔθH(t)    = ΔθH,R * K^(2*m)                     (sicak-nokta'nin yaga gore artisi)
-      θH(t)     = θ_ambient(t) + ΔθTO(t) + ΔθH(t)     (sicak-nokta sicakligi)
-      FAA(t)    = exp(15000/383 - 15000/(θH+273))     (yaslanma hizlandirma faktoru,
-                                                       110°C referansta FAA=1)
-      LoL_saat  = Σ FAA(t) * Δt                       (esdeger yaslanma saati)
-      %omur     = LoL_saat / normal_life_hours * 100
+    ADIMLAR (IEC 60076-7):
+      K(t)     = (baz+sarj)(t) / S_anma                          (p.u. yuklenme)
+      Δθo,ult  = Δθor·((1 + R·K²)/(1 + R))^x                      (ust-yag nihai artisi)
+      Δθo[t]   = Δθo[t-1] + (Δt/(k11·τo))·(Δθo,ult − Δθo[t-1])    (yag ataleti, τo)
+      Δθh1[t]  = Δθh1[t-1] + (Δt/(k22·τw))·(k21·Δθhr·K^y − Δθh1[t-1])
+      Δθh2[t]  = Δθh2[t-1] + (Δt·k22/τo)·((k21−1)·Δθhr·K^y − Δθh2[t-1])
+      Δθh      = Δθh1 − Δθh2                                      (sicak-nokta gradyani)
+      θh[t]    = θa(t) + Δθo[t] + Δθh[t]                          (sicak-nokta °C)
+      V(t)     = 2^((θh(t) − 98)/6)        (bagil yaslanma; normal kagit, 98°C'de V=1)
+      LoL_saat = Σ V(t)·Δt                                        (esdeger yaslanma saati)
 
-    FINANSAL KARSILIK:
-      Esdeger tuketilen omur saatleri -> trafo yenileme maliyetinin orani kadar
-      "tuketilen sermaye". Iki senaryo farki = onlenen erken yenileme tasarrufu.
+    ORTAM SICAKLIGI (madde 1): θa(t), GERCEK Ankara sicaklik serisidir (Mayis
+    basindan, en kotu senaryo). Disaridan verilmezse cfg'den uretilir.
     """
     th = cfg.thermal
     rated = cfg.station.rated_kw
     T = len(facility_kw)
     dt_h = HOURS_PER_MINUTE  # saat
 
-    # Ortam sicakligi gun-ici profili (ogleden sonra tepe ~15:00)
-    hour = (np.arange(T) % MINUTES_PER_DAY) / 60.0
-    ambient = th.ambient_mean_c + th.ambient_amp_c * np.sin(2 * np.pi * (hour - 9.0) / 24.0)
+    if ambient is None:
+        ambient = ambient_series(cfg)
+    ambient = np.asarray(ambient, dtype=np.float64)
+    if len(ambient) != T:                       # uzunluk uyusmazsa kirp/doldur
+        if len(ambient) > T:
+            ambient = ambient[:T]
+        else:
+            ambient = np.concatenate([ambient, np.full(T - len(ambient), ambient[-1])])
 
-    # Per-unit yuklenme
+    # Per-unit yuklenme ve nihai (steady-state) artislar
     K = facility_kw / rated
+    dTO_ult = th.dtheta_or * ((1.0 + th.R_ratio * K ** 2) / (1.0 + th.R_ratio)) ** th.x_oil_exp
+    hs_drive = th.dtheta_hr * K ** th.y_wind_exp          # K^y surucu terimi
 
-    # Ust-yag nihai artisi (vektorize)
-    dTO_ult = th.dtheta_to_rated * ((K ** 2 * th.R_ratio + 1.0) / (th.R_ratio + 1.0)) ** th.n_exp
+    # Fark denklemleri (tek gecis O(T)). Δt = 1 dakika.
+    a_o = 1.0 / (th.k11 * th.tau_o_min)                   # ust-yag IIR katsayisi
+    a_h1 = 1.0 / (th.k22 * th.tau_w_min)                  # hot-spot 1 (sargi)
+    a_h2 = th.k22 / th.tau_o_min                          # hot-spot 2 (yag gecikmesi)
 
-    # Ust-yag gercek artisi: 1. derece IIR (oil termal ataleti). Tek gecis O(T).
-    alpha = 1.0 / th.tau_to_min     # Δt(=1 dk)/τ
     dTO = np.empty(T)
-    prev = dTO_ult[0]
+    dHS = np.empty(T)
+    o_prev = dTO_ult[0]
+    h1_prev = th.k21 * hs_drive[0]
+    h2_prev = (th.k21 - 1.0) * hs_drive[0]
     for t in range(T):
-        prev = prev + alpha * (dTO_ult[t] - prev)
-        dTO[t] = prev
-
-    # Sicak-nokta'nin yaga gore artisi (hizli, kararli hal)
-    dHS = th.dtheta_hs_rated * K ** (2 * th.m_exp)
+        o_prev = o_prev + a_o * (dTO_ult[t] - o_prev)
+        h1_prev = h1_prev + a_h1 * (th.k21 * hs_drive[t] - h1_prev)
+        h2_prev = h2_prev + a_h2 * ((th.k21 - 1.0) * hs_drive[t] - h2_prev)
+        dTO[t] = o_prev
+        dHS[t] = h1_prev - h2_prev
 
     theta_hs = ambient + dTO + dHS
 
-    # Yaslanma hizlandirma faktoru (vektorize)
-    FAA = np.exp(15000.0 / 383.0 - 15000.0 / (theta_hs + 273.0))
+    # Bagil yaslanma hizi V (IEC normal kagit, 98°C referans): V = 2^((θh−98)/6)
+    V = np.power(th.aging_base, (theta_hs - th.hs_reference_c) / th.aging_doubling_k)
 
-    lol_hours = float(np.sum(FAA) * dt_h)                # esdeger yaslanma saati
+    lol_hours = float(np.sum(V) * dt_h)                  # esdeger yaslanma saati (pencere)
     real_hours = T * dt_h
-    pct_life = lol_hours / th.normal_life_hours * 100.0  # tuketilen omur yuzdesi
+    pct_life = lol_hours / th.normal_life_hours * 100.0  # PENCEREDE tuketilen omur %
     aging_cost = lol_hours / th.normal_life_hours * th.transformer_cost_tl
 
-    # Ortalama yaslanma hizlandirma faktoru ve ESDEGER TRAFO OMRU (yil):
-    #   Bu yuklenme profili surerse trafo, FAA katına orantili olarak daha
-    #   erken biter. equiv_life_years = normal_life / (8760 * avg_FAA)
-    avg_faa = lol_hours / max(real_hours, 1e-9)
-    # Esdeger omur, tasarim omru tavaniyla kirpilir (madde 2): dusuk yuklenmede
-    # avg_faa cok kuculur ve kirpilmazsa esdeger omur yuzlerce/binlerce yila cikar
-    # (fiziksel degil). Tavan, trafonun termal-disi (nem/busing/OLTC) omru sinirini
-    # temsil eder. Yine de iki senaryo arasindaki FARK (yaslanma maliyeti) korunur.
-    equiv_life_raw = th.normal_life_hours / (8760.0 * max(avg_faa, 1e-9))
-    equiv_life_years = min(th.design_life_years, equiv_life_raw)
+    avg_V = lol_hours / max(real_hours, 1e-9)            # ortalama bagil yaslanma (pencere)
 
-    # Gunluk kumulatif yaslanma (grafik icin) - dakika dizisini gune indir
-    faa_daily = FAA.reshape(-1, MINUTES_PER_DAY).sum(axis=1) * dt_h  # gun basina saat
-    cum_aging_hours = np.cumsum(faa_daily)
+    # Gunluk kumulatif yaslanma (grafik icin)
+    V_daily = V.reshape(-1, MINUTES_PER_DAY).sum(axis=1) * dt_h
+    cum_aging_hours = np.cumsum(V_daily)
 
     return {
         "K_peak": float(K.max()),
         "theta_hs_peak": float(theta_hs.max()),
         "theta_hs_mean": float(theta_hs.mean()),
-        "lol_hours": lol_hours,
-        "pct_life_consumed": pct_life,
-        "avg_faa": avg_faa,
-        "equiv_life_years": equiv_life_years,
-        "aging_cost_tl": aging_cost,
-        "cum_aging_hours_daily": cum_aging_hours,    # shape (days,)
-        "theta_hs": theta_hs,                        # shape (T,) - grafik icin
+        "ambient_peak": float(ambient.max()),
+        "lol_hours": lol_hours,                          # pencere (sim) yaslanma saati
+        "pct_life_consumed": pct_life,                   # pencerede tuketilen %
+        "avg_V": avg_V,
+        "aging_cost_tl": aging_cost,                     # pencere yaslanma maliyeti
+        "cum_aging_hours_daily": cum_aging_hours,        # shape (days,)
+        "theta_hs": theta_hs,                            # shape (T,)
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 2b) 30 YILLIK OMUR EKSTRAPOLASYONU + ERTELENEN DEGISIM MALIYETI (madde 3)
+# --------------------------------------------------------------------------- #
+def transformer_life_projection(cfg: SimConfig, th_opt: Dict, th_naive: Dict,
+                                seasonal_factor: float = None) -> Dict[str, object]:
+    """
+    EN KOTU 100 gunluk pencere yaslanmasini, MEVSIMSEL DUZELTME ile yila ve
+    30 yila tasiyarak (madde 3):
+      - termal-esdeger trafo omru (yil),
+      - DLM'in sagladigi OMUR UZAMASI (yil),
+      - 30 yilda tuketilen omur yuzdesi,
+      - ERTELENEN trafo degisim maliyeti = (uzamanin toplam omre orani) × trafo maliyeti
+    hesaplar.
+
+    Yaklasim:
+      yillik_LoL = (pencere_LoL / sim_gun) × 365 × mevsim_faktoru
+      termal_esdeger_omur = normal_omur_saat / yillik_LoL
+      30y_tuketilen_kesir  = yillik_LoL × 30 / normal_omur_saat
+      ertelenen_maliyet    = (30y_kesir_naive − 30y_kesir_opt) × trafo_maliyeti
+    """
+    th = cfg.thermal
+    days = cfg.days
+    if seasonal_factor is None:
+        seasonal_factor = seasonal_aging_factor(cfg)
+
+    horizon = th.extrapolation_years
+    norm = th.normal_life_hours
+
+    def project(thd: Dict) -> Dict[str, float]:
+        annual_lol = (thd["lol_hours"] / max(days, 1)) * 365.0 * seasonal_factor
+        equiv_life_raw = norm / max(annual_lol, 1e-9)        # termal-esdeger omur (yil)
+        equiv_life = min(th.design_life_years, equiv_life_raw)
+        frac_horizon = annual_lol * horizon / norm           # 30 yilda tuketilen kesir
+        return {
+            "annual_lol_hours": annual_lol,
+            "equiv_life_thermal_years": equiv_life_raw,      # kirpilmamis (termal)
+            "equiv_life_years": equiv_life,                  # tasarim tavaniyla kirpik
+            "frac_life_horizon": frac_horizon,               # 0..1 (30 yil)
+            "pct_life_horizon": frac_horizon * 100.0,
+        }
+
+    p_opt = project(th_opt)
+    p_naive = project(th_naive)
+
+    # OMUR UZAMASI (termal-esdeger): DLM ile trafo termal omru ne kadar uzar.
+    life_extension_years = p_opt["equiv_life_thermal_years"] - p_naive["equiv_life_thermal_years"]
+
+    # ERTELENEN DEGISIM MALIYETI (madde 3): 30 yillik ufukta naive'in opt'a gore
+    # FAZLA tukettigi omur kesri × trafo maliyeti. (Uzamanin toplam omre orani,
+    # tipik trafo omru = design_life uzerinden de ifade edilir.)
+    extra_frac_horizon = max(0.0, p_naive["frac_life_horizon"] - p_opt["frac_life_horizon"])
+    deferred_replacement_tl = extra_frac_horizon * th.transformer_cost_tl
+
+    return {
+        "seasonal_factor": seasonal_factor,
+        "horizon_years": horizon,
+        "proj_opt": p_opt,
+        "proj_naive": p_naive,
+        "life_extension_years": life_extension_years,
+        "extra_frac_horizon": extra_frac_horizon,
+        "deferred_replacement_tl": deferred_replacement_tl,
     }
 
 
@@ -339,29 +406,38 @@ def full_analysis(cfg: SimConfig, fleet: pd.DataFrame,
     """Dashboard icin tum makro KPI'lari tek sozlukte toplar."""
     c_opt = summarize_costs(cfg, opt)
     c_naive = summarize_costs(cfg, naive)
-    th_opt = thermal_loss_of_life(cfg, opt.facility_kw)
-    th_naive = thermal_loss_of_life(cfg, naive.facility_kw)
+    # Gercek Ankara ortam sicakligi (madde 1) - iki senaryoda da AYNI seri.
+    ambient = ambient_series(cfg)
+    th_opt = thermal_loss_of_life(cfg, opt.facility_kw, ambient)
+    th_naive = thermal_loss_of_life(cfg, naive.facility_kw, ambient)
+    # 30 yillik omur projeksiyonu + ertelenen degisim maliyeti (madde 3)
+    life_proj = transformer_life_projection(cfg, th_opt, th_naive)
     soh = soh_analysis(cfg, fleet, opt.sessions, naive.sessions)
     roi = power_shaving_roi(cfg, c_opt["peak_facility_kw"], c_naive["peak_facility_kw"])
 
     energy_saving = c_naive["energy_cost_tl"] - c_opt["energy_cost_tl"]
     demand_saving = c_naive["demand_cost_tl"] - c_opt["demand_cost_tl"]
-    thermal_saving = th_naive["aging_cost_tl"] - th_opt["aging_cost_tl"]
+    # TRAFO TASARRUFU (madde 3): pencere yaslanma farki yerine 30 yillik ufukta
+    # ERTELENEN DEGISIM MALIYETI kullanilir (ortalama trafo omru boyunca DLM).
+    thermal_saving = life_proj["deferred_replacement_tl"]
+    thermal_saving_window = th_naive["aging_cost_tl"] - th_opt["aging_cost_tl"]
     soh_saving = soh["delayed_replacement_value_tl"]
     total_saving = energy_saving + demand_saving + thermal_saving + soh_saving
 
     days = cfg.days
     annual = 365.0 / max(days, 1)
-    thermal_saving_annual = thermal_saving * annual
 
     return {
         "costs_opt": c_opt, "costs_naive": c_naive,
         "thermal_opt": th_opt, "thermal_naive": th_naive,
+        "life_proj": life_proj,
+        "ambient_peak_c": float(np.max(ambient)),
         "soh": soh, "roi": roi,
         "energy_saving_tl": energy_saving,
         "demand_saving_tl": demand_saving,
-        "thermal_saving_tl": thermal_saving,
-        "thermal_saving_annual_tl": thermal_saving_annual,
+        "thermal_saving_tl": thermal_saving,                 # 30 yil ertelenen maliyet
+        "thermal_saving_window_tl": thermal_saving_window,   # pencere (100 gun) farki
+        "thermal_life_extension_years": life_proj["life_extension_years"],
         "soh_saving_tl": soh_saving,
         "total_saving_tl": total_saving,
         "annual_total_saving_tl": total_saving * annual,

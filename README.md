@@ -23,10 +23,10 @@ Arka uç **Python (NumPy/Pandas vektörizasyon)**, ön yüz **Streamlit** + **Ma
 │   └── market_<senaryo>.parquet     # PTF / SMF egrileri
 └── src/
     ├── __init__.py
-    ├── config.py           # Tum yapilandirma (donanim, fiyat, termal, SOH)
-    ├── data_generator.py   # Arac DB, kalici filo, baz yuk, PTF/SMF
-    ├── optimizer.py        # Multi-objective + ±60 kW ramp + trafo korumasi
-    └── financials.py       # PTF entegrasyonu, IEEE C57.91 termal, SOH, ROI
+    ├── config.py           # Tum yapilandirma (donanim, fiyat, IEC termal, SOH, diversity)
+    ├── data_generator.py   # Arac DB, kalici filo, baz yuk, PTF/SMF, Ankara sicakligi
+    ├── optimizer.py        # Multi-objective + ramp + trafo korumasi + cesitlilik
+    └── financials.py       # PTF entegrasyonu, IEC 60076-7 termal, 30y omur, SOH, ROI
 ```
 
 ## 🚀 Çalıştırma
@@ -43,12 +43,16 @@ Tarayıcıda `http://localhost:8501` açılır.
 ## 🔑 Temel Modeller
 
 ### Donanım & Veri
-- **1600 kVA** ana trafo; tesis **baz yükü tepe noktada ~%70 (≈1120 kW)**'e ulaşır,
-  kalan kapasite şarj içindir.
-- **8 adet karışık DC soket**: 2×200 + 3×180 + 3×120 kW (yapılandırılabilir).
+- **1600 kVA** ana trafo; ortalama **güç faktörü cosφ=0.95** → etkin anma **1520 kW**
+  (madde 6). Tesis **baz yükü tepe noktada %60 (≈912 kW)**'e ulaşır (madde 9).
+- **Karışık DC soket**: 2×200 + 1×180 + 1×120 = **700 kW kurulu** (yapılandırılabilir).
+  **Çeşitlilik faktörü 0.60** ile eşzamanlı talep ≈ 420 kW = trafo anmasının **%27.6**'sı
+  (hedef %20–30, madde 9) → baz (%60) + istasyon (%27.6) < %100 → **overload yok**.
 - **23 gerçek araç** (Togg, Tesla, Taycan, Ford E-Transit…) gerçek Net kWh / Max DC kW.
 - **Kalıcı filo:** sabit ID'li araçlar 100 gün boyunca tekrar tekrar şarj olur
   (kümülatif SOH analizi için şart). Her gün **stokastik geliş SoC**.
+- **Gerçek Ankara sıcaklıkları** (madde 1): 100 gün **Mayıs başından** başlar
+  (en kötü senaryo → ~9 Ağustos, en sıcak bant), termal modele girdi.
 
 ### Fiyatlandırma (iki ölçek)
 - **PTF/SMF** (büyük fabrika): EPİAŞ gerçeklerine yakın saatlik **PTF** ve **SMF**
@@ -56,22 +60,27 @@ Tarayıcıda `http://localhost:8501` açılır.
 - **3-Zamanlı Tarife** (küçük tesis): Gece / Gündüz / Puant (TL/kWh).
 
 ### Optimizasyon (`optimizer.py`)
-- **±60 kW ramp limiti** (hard constraint) — matematiği dosyada adım adım açıklı.
-- **Trafo koruması:** optimize strateji toplam yükü `rated_kw` üstüne çıkarmaz
-  (peak-shaving). **Bodoslama** bunu yok sayar → trafo aşırı yüklenir.
+- **Ramp limiti** (madde 4): kurulu istasyon gücünün **~%10/dk**'sı (mutlak sabit
+  değil; güç-kalitesi/EMS yumuşatması, IEC 61000-3-3/-11). Cihaz kendisi ISO 15118 /
+  IEC 61851 ile saniyeler içinde rampa yapar.
+- **Çeşitlilik faktörü (madde 6):** algoritma-öncesi (LMS yok) eşzamanlı talep
+  = çeşitlilik × kurulu güç (IEC 60364-7-722). Algoritma = aktif yük yönetimi (LMS).
+- **Trafo/sözleşme koruması:** optimize strateji toplam yükü trafo/sözleşme gücü
+  üstüne çıkarmaz (peak-shaving). **Doğru boyutlandırma** ile naive bile aşmaz (madde 9).
 - **C-rate (SOH) tavanı**; aciliyet bunu geçersiz kılabilir (servis korunur).
-- Şarj istisnasız **%80 SoC**'de biter.
+- Şarj istisnasız **%80 SoC**'de biter. **Şarj verimi %93** (madde 7).
 - **α/β/γ** ağırlıkları: Şarj Süresi / SOH Koruma / Maliyet.
 
-### Trafo Termal Ömür (`financials.py`, IEEE C57.91 benzeri)
+### Trafo Termal Ömür (`financials.py`, IEC 60076-7:2018)
 ```
-K(t)     = S(t)/S_rated
-ΔθTO,ult = ΔθTO,R·((K²·R+1)/(R+1))^n      (üst-yağ nihai artışı)
-ΔθTO(t)  : 1. derece gecikme (yağ termal ataleti, τ=180 dk)
-ΔθH(t)   = ΔθH,R·K^(2m)                    (sıcak-nokta yağ üstü artışı)
-θH(t)    = θ_ortam + ΔθTO + ΔθH
-FAA(t)   = exp(15000/383 − 15000/(θH+273)) (110°C'de FAA=1)
-LoL      = Σ FAA·Δt  →  %ömür, eşdeğer ömür (yıl), önlenen yaşlanma maliyeti
+K(t)     = (Baz+Şarj)/S_anma
+Δθo,ult  = Δθor·((1+R·K²)/(1+R))^x         (üst-yağ nihai artışı)
+Δθo[t]   : fark denklemi (yağ ataleti, τo=210 dk)
+Δθh      = Δθh1 − Δθh2                      (iki zaman sabitli sıcak-nokta gradyanı)
+θh(t)    = θa(t) + Δθo + Δθh               (θa = gerçek Ankara sıcaklığı, madde 1)
+V(t)     = 2^((θh−98)/6)                    (98°C'de V=1, normal kâğıt)
+LoL      = Σ V·Δt  →  30 yıl ekstrapolasyonu (mevsimsel düzeltme), ertelenen
+           trafo değişim maliyeti (madde 3)
 ```
 
 ---
@@ -81,27 +90,33 @@ LoL      = Σ FAA·Δt  →  %ömür, eşdeğer ömür (yıl), önlenen yaşlanm
 **BÖLÜM A — 1 Günlük Mikro Analiz**
 - Kombine yük + maliyet grafiği: baz yük (fill), Algoritma Öncesi/Sonrası trafo
   yükü, trafo anma çizgisi + **twinx** ile PTF/Tarife eğrisi.
+- **Şarj eğrisi — Algoritma Öncesi vs Sonrası** kıyas grafiği (madde 8).
+- **Araç bazlı şarj süreleri (bu gün):** her oturum için algoritma öncesi/sonrası
+  süre ve uzama — günü takvimden seçerek her **t** günü için (madde 8).
 - 1 günlük tasarruf kartları (TL ve %).
 - Power-shaving ROI metni (tıraşlama %, yaratılan headroom, +istasyon, +%EV).
 
 **BÖLÜM B — 100 Günlük Makro Analiz**
-- Trafo termal ömür tüketimi (kümülatif yaşlanma, Algoritmalı vs Algoritmasız) +
-  sıcak-nokta düşüşü, **eşdeğer trafo ömrü (yıl)**, önlenen yaşlanma maliyeti.
+- **Trafo termal ömür (IEC 60076-7, gerçek Ankara sıcaklıkları)**: kümülatif
+  yaşlanma, sıcak-nokta, 100 gün ve **30 yılda tüketilen ömür %'si**, **ertelenen
+  trafo değişim maliyeti** (madde 3).
 - Kümülatif SOH grafiği + geciktirilen batarya değişim bedeli.
 - Araç bazlı tablo: SOH düşüşü (algoritmalı vs algoritmasız), toplam şarj süresi,
-  maksimum şarj gecikme %'si, korunan batarya bedeli.
+  maksimum şarj uzaması, korunan batarya bedeli.
 
 ---
 
 ## 🧭 Mühendislik Notları (dürüstlük)
-- En büyük finansal kalemler **demand charge (puant güç bedeli)** ve **SOH
-  koruması**dır; bunlar trafonun aşırı yüklenmesini önlemenin doğrudan parasal
-  karşılığıdır.
-- **Termal ömür** kalemi 100 günlük ufukta TL olarak küçüktür — çünkü 1600 kVA
-  trafo bu yüklerde yalıtım ömrünü yavaş tüketir. Asıl termal kazanç **niteldir:**
-  bodoslama sıcak-noktayı 110°C yalıtım sınırına dayar; optimize strateji bunu
-  güvenli bölgeye çeker ve **eşdeğer trafo ömrünü kat kat uzatır** (ör. 700→2477 yıl).
-- **FABRIKA** senaryosunda filo vardiya sonunda eşzamanlı döner; bodoslama akşam
-  baz yükü hâlâ yüksekken trafoyu saatlerce aşırı yükler — termal farkın görüldüğü
-  yer burasıdır. **AVM**'de dar kalış süresi nedeniyle enerji kalemi ~nötr olabilir;
-  değer SOH + demand + power-shaving'dedir.
+- **Madde 9 gereği sistem doğru boyutlandırılmıştır:** baz tepe %60 + çeşitlilikli
+  istasyon %20–30 < %100 → **algoritma öncesinde bile trafo aşımı (overload) yoktur.**
+  Bu nedenle DLM'in değeri "hard overload önleme" değil; **enerji maliyeti
+  (PTF kaydırma)**, **demand charge / peak-shaving**, **termal ömür** ve **SOH**'tur.
+- **Termal ömür** kalemi mütevazıdır — çünkü doğru boyutlandırılmış (overload'suz)
+  yükte sıcak-nokta IEC referansının (98°C) çoğunlukla altındadır ve trafo ömrü
+  **fiziksel tasarım ömrüyle (30 yıl)** sınırlıdır. Model yine de IEC 60076-7 ile
+  gerçek Ankara sıcaklıkları altında **30 yıllık ertelenen değişim maliyetini**
+  dürüstçe raporlar (madde 3).
+- **FABRIKA** senaryosunda filo vardiya sonunda eşzamanlı döner; çeşitlilik faktörü
+  bu eşzamanlı talebi gerçekçi biçimde sınırlar (IEC 60364-7-722). **AVM**'de dar
+  kalış süresi nedeniyle enerji kalemi ~nötr olabilir; değer SOH + demand +
+  power-shaving'dedir.

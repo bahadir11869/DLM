@@ -32,7 +32,9 @@ from src.financials import build_price_signal, full_analysis, summarize_costs
 from src import epias
 
 st.set_page_config(page_title="DLM | DC Sarj Optimizasyonu", layout="wide", page_icon="⚡")
-START_DATE = _dt.date(2025, 1, 1)
+# EN KOTU SENARYO (madde 1): 100 gun MAYIS basindan baslar -> ~9 Agustos
+# (Ankara'nin en sicak bandi -> en yuksek trafo termal yaslanmasi).
+START_DATE = _dt.date(2025, 5, 1)
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 
@@ -43,12 +45,13 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 def run_simulation(scenario, pricing_mode, days, seed, regen_token, fleet_size,
                    n200, n180, n120, alpha, beta, gamma, activation_mode,
                    use_epias, epias_user, epias_pass, base_mult,
-                   pf=1.0, charge_eff=0.92):
+                   pf=0.95, charge_eff=0.93, diversity=0.60):
     eff_seed = int(seed) + int(regen_token) * 7919
     cfg = SimConfig(
         days=days, seed=eff_seed,
         station=StationConfig(n_socket_200=n200, n_socket_180=n180, n_socket_120=n120,
-                              power_factor=float(pf), charge_efficiency=float(charge_eff)),
+                              power_factor=float(pf), charge_efficiency=float(charge_eff),
+                              diversity_factor=float(diversity)),
         pricing=PricingConfig(mode=pricing_mode, use_epias=use_epias,
                               epias_username=epias_user, epias_password=epias_pass),
         thermal=ThermalConfig(), financial=FinancialConfig(),
@@ -74,13 +77,28 @@ def run_simulation(scenario, pricing_mode, days, seed, regen_token, fleet_size,
     price = build_price_signal(cfg, ptf, smf)
     results = run_both(cfg, sessions, base_load, price, cfg.weights)
     analysis = full_analysis(cfg, fleet, results["optimized"], results["naive"])
+
+    # ARAC BAZLI GUNLUK SARJ SURELERI (madde 8): her oturum icin algoritma oncesi
+    # (naive) ve sonrasi (opt) sarj suresi - gun bazli filtrelenebilir.
+    so = results["optimized"].sessions[["session_id", "day", "vehicle_id", "model",
+                                        "charge_duration_min", "completed"]]
+    sn = results["naive"].sessions[["session_id", "charge_duration_min", "completed"]]
+    sessions_cmp = so.merge(sn, on="session_id", suffixes=("_opt", "_naive"))
+
     return {
         "cfg_days": days, "rated_kw": cfg.station.rated_kw,
+        "transformer_kva": cfg.station.transformer_kva, "power_factor": cfg.station.power_factor,
+        "diversity_factor": cfg.station.diversity_factor,
+        "charge_efficiency": cfg.station.charge_efficiency,
+        "diversified_kw": cfg.station.diversified_demand_kw,
+        "ramp_kw_per_min": cfg.station.ramp_kw_per_min,
         "pricing_mode": pricing_mode, "ptf_source": ptf_source,
         "fleet_size": len(fleet), "n_sessions": len(sessions),
-        "installed_kw": float(sum(cfg.station.socket_list())),
+        "installed_kw": float(cfg.station.installed_kw),
         "base_min_kw": float(base_load.min()), "base_max_kw": float(base_load.max()),
+        "base_peak_frac": float(base_load.max() / cfg.station.rated_kw),
         "max_install_kw": float(cfg.station.rated_kw - base_load.min()),
+        "sessions_cmp": sessions_cmp,
         "base_load": base_load,
         "facility_opt": results["optimized"].facility_kw,
         "facility_naive": results["naive"].facility_kw,
@@ -138,19 +156,26 @@ fleet_size = st.sidebar.slider("Kalici filo buyuklugu (arac)", 5, 150,
     help="Sisteme kayitli, 100 gun boyunca tekrar tekrar sarj olan arac sayisi.")
 
 st.sidebar.markdown("#### 🔌 DC Sarj Istasyonlari (tek soketli)")
-st.sidebar.caption("Her istasyon TEK soketlidir (ayni anda tek arac).")
+st.sidebar.caption("Her istasyon TEK soketlidir (ayni anda tek arac). Varsayilan kurulum "
+                   "(2/1/1 = 700 kW), cesitlilik faktoruyle trafo anmasinin ~%20-30'unda kalir.")
 c1, c2, c3 = st.sidebar.columns(3)
 n200 = c1.number_input("200 kW", 0, 12, 2)
 n180 = c2.number_input("180 kW", 0, 12, 1)
-n120 = c3.number_input("120 kW", 0, 12, 2)
+n120 = c3.number_input("120 kW", 0, 12, 1)
 
-with st.sidebar.expander("⚙️ Gelismis: Guc Faktoru & Sarj Verimi", expanded=False):
-    pf = st.slider("Guc faktoru (cosφ)", 0.85, 1.00, 1.00, 0.01,
-        help="Tesis guc faktoru. pf<1 ise trafo gorunur guc (kVA) cinsinden daha cok "
-             "yuklenir (anma kW = kVA×pf); termal yaslanma artar.")
-    charge_eff = st.slider("Sarj verimi (sebeke→batarya)", 0.85, 1.00, 0.92, 0.01,
-        help="DC sarj donusum/isil verimi. Sebekeden cekilen (faturalanan + trafo yuku) "
-             "guc = batarya gucu / verim. Dusukse maliyet ve trafo yuku artar.")
+with st.sidebar.expander("⚙️ Gelismis: Guc Faktoru · Verim · Cesitlilik", expanded=False):
+    pf = st.slider("Ortalama guc faktoru (cosφ)", 0.85, 1.00, 0.95, 0.01,
+        help="Tesis ORTALAMA guc faktoru (madde 6). Trafo etkin anmasi = kVA×cosφ "
+             "(1600×0.95=1520 kW). pf<1 ise trafo gorunur guc (kVA) cinsinden daha cok "
+             "yuklenir; termal yaslanma artar.")
+    charge_eff = st.slider("Sarj verimi (sebeke→batarya)", 0.85, 1.00, 0.93, 0.01,
+        help="DC hizli sarj ORTALAMA verimi (madde 7, ~%92-95). Sebekeden cekilen "
+             "(faturalanan + trafo yuku) guc = batarya gucu / verim. Dusukse maliyet ve "
+             "trafo yuku artar.")
+    diversity = st.slider("Cesitlilik (esZamanlilik) faktoru", 0.30, 1.00, 0.60, 0.05,
+        help="Madde 6 (IEC 60364-7-722). Algoritma-oncesi (LMS yok) esZamanli istasyon "
+             "talebi = bu faktor × kurulu guc. <1 ise tum soketler ayni anda tam guce "
+             "ulasmaz (gercekci talep tahmini). Algoritma = aktif yuk yonetimi (LMS).")
 
 st.sidebar.markdown("#### 🤖 Algoritma Devreye Girme")
 activation_label = st.sidebar.radio("Algoritma ne zaman calissin?",
@@ -176,7 +201,8 @@ if b1.button("🚀 Calistir", type="primary", use_container_width=True):
     st.session_state["_do_run"] = True
 
 st.title("⚡ Dinamik Yuk Dagilimi, Enerji & Maliyet Optimizasyonu")
-st.caption("1600 kVA Trafo · Tek-soketli Karisik DC Istasyonlar · PTF/SMF & IEEE C57.91 Termal Model")
+st.caption("1600 kVA Trafo (cosφ=0.95 → 1520 kW) · Cesitlilik Faktorlu DC Istasyonlar · "
+           "PTF/SMF · IEC 60076-7 Termal Model · Gercek Ankara Sicakliklari (Mayis-Agustos)")
 
 # --------------------------------------------------------------------------- #
 # Bilgi panelleri
@@ -196,8 +222,10 @@ gucu zamana yayar (sarj suresini uzatip dusuk guce ceker) ve bu pencere icindeki
    γ oraninda opsiyonel sarj, **aracin kendi penceresi icindeki** ucuz dakikalara
    bindirilir (pahali dakikalarda kisilip ucuz dakikalara birakilir; arac
    baska saate tasinmaz, sadece guc profili sekillenir).
-3. **Trafo + ±60 kW ramp:** Toplam (baz+sarj) yuk trafo anmasini asamaz; dakikalik
-   degisim ±60 kW.
+3. **Trafo + ramp:** Toplam (baz+sarj) yuk trafo/sozlesme gucunu asamaz; dakikalik
+   degisim, kurulu istasyon gucunun ~%10'u ile sinirlidir (madde 4; guc-kalitesi
+   yumusatmasi — IEC 61000-3-3/-11). Cihaz kendisi ISO 15118/IEC 61851 ile saniyeler
+   icinde rampa yapar; sinir SAHA EMS tercihidir.
 4. **ESIT OLMAYAN paylasim:** Toplam guc araclara **oncelik skoruna** gore dagitilir:
    `skor = (0.6+α)·aciliyet + 0.8·(bosluk: 1−SoC) + β·(batarya boyutu)`.
    Yani **deadline'i yakin, SoC'si dusuk** araclar onceliklidir; β buyukse buyuk
@@ -222,10 +250,14 @@ Ayrintili surum: **`FINANSAL_MODEL.md`**. Ozet:
 - **Demand Charge** = Σ_ay tepe_guc · 90 TL/kW/ay. **Guc Asim Cezasi** = Σ_ay
   max(0, tepe−sozlesme) · (90 × **3**). (EPDK *Tarifeler Yonetmeligi*; ceza kati
   dagitim sirketine gore degisir.)
-- **Trafo Termal (IEEE C57.91):** sicak-nokta θH'den FAA=exp(15000/383−15000/(θH+273));
-  Tuketilen omur=Σ FAA·Δt; **Yaslanma Maliyeti** = (omur kesri)×Trafo (4.000.000 TL).
+- **Trafo Termal (IEC 60076-7):** fark-denklemi sicak-nokta θH (gercek Ankara ortam
+  sicakligi, Mayis-Agustos); bagil yaslanma V=2^((θH−98)/6); Tuketilen omur=Σ V·Δt.
+  **30 yil ekstrapolasyonu** (mevsimsel duzeltme) ile **Ertelenen Degisim** =
+  (naive−opt 30y omur kesri)×Trafo (4.000.000 TL).
 - **SOH:** stres_kWh=Σ E·(1+0.6·C-rate²); SOH kaybi=stres/(kapasite·1500)·%20;
   **Geciktirilen Degisim** = Σ (kayip farki)×kapasite×4500 TL/kWh.
+- **Cesitlilik faktoru (madde 6):** IEC 60364-7-722; algoritma-oncesi esZamanli talep
+  = cesitlilik × kurulu guc. **Guc faktoru** cosφ=0.95 (etkin kW=kVA×cosφ). **Verim** %93.
 - **Power-Shaving:** tirasanan kW ile ilave istasyon ve EV kapasitesi.
 
 > Tum varsayimlar `src/config.py`'de degistirilebilir. Kesin teklif icin EPDK onayli
@@ -241,7 +273,7 @@ if st.session_state.get("_do_run"):
             n200=int(n200), n180=int(n180), n120=int(n120),
             alpha=alpha, beta=beta, gamma=gamma, activation_mode=activation_mode,
             use_epias=use_epias, epias_user=epias_user, epias_pass=epias_pass,
-            pf=float(pf), charge_eff=float(charge_eff),
+            pf=float(pf), charge_eff=float(charge_eff), diversity=float(diversity),
         )
         st.session_state["payload"] = run_simulation(base_mult=1.0, **st.session_state["params"])
         # Baz yuk +%15 (guc asim cezasi) senaryosu her calistirmada OTOMATIK uretilir.
@@ -261,16 +293,30 @@ dt = HOURS_PER_MINUTE
 if P["pricing_mode"] == "PTF":
     st.info(f"📡 PTF kaynagi: **{P['ptf_source']}**")
 
-# Kurulum guardrail (madde 3)
-installed = P["installed_kw"]; maxinstall = P["max_install_kw"]
-if installed > maxinstall:
-    st.warning(f"⚠️ Kurulu istasyon gucu **{installed:.0f} kW** > gece headroom "
-        f"**{maxinstall:.0f} kW** ({P['rated_kw']:.0f} − min baz {P['base_min_kw']:.0f}). "
-        f"Bu kurulum ancak **dinamik yuk yonetimi** ile guvenlidir; bodoslama gunduz "
-        f"trafoyu asar (overload).")
+# Kurulum guardrail (madde 6 + 9): cesitlilik faktorlu talep ve overload kontrolu
+installed = P["installed_kw"]; rated = P["rated_kw"]
+div = P["diversity_factor"]; diversified = P["diversified_kw"]
+div_pct = diversified / rated * 100.0
+base_pct = P["base_peak_frac"] * 100.0
+naive_peak_pct = P["peak_naive"] / rated * 100.0
+gr = st.columns(4)
+gr[0].metric("Trafo Etkin Anma", f"{rated:.0f} kW", f"{P['transformer_kva']:.0f} kVA × {P['power_factor']:.2f}")
+gr[1].metric("Kurulu İstasyon", f"{installed:.0f} kW", f"cesitlilik {div:.2f}")
+gr[2].metric("Cesitlilikli Talep", f"{diversified:.0f} kW", f"%{div_pct:.0f} trafo (hedef %20-30)")
+gr[3].metric("Baz Yuk Tepe", f"{P['base_max_kw']:.0f} kW", f"%{base_pct:.0f} trafo (hedef %60)")
+
+if naive_peak_pct <= 100.0:
+    st.success(f"✅ **Overload YOK** (madde 9): algoritma ÖNCESI (bodoslama) tepe "
+        f"**{P['peak_naive']:.0f} kW** = trafo anmasinin **%{naive_peak_pct:.0f}**'i ≤ %100. "
+        f"Cesitlilik faktorlu istasyon talebi (%{div_pct:.0f}) + baz tepe (%{base_pct:.0f}) "
+        f"trafoyu asmaz; DLM faydasi peak-shaving, maliyet, termal omur ve SOH'tur.")
 else:
-    st.success(f"✅ Kurulu istasyon gucu **{installed:.0f} kW** ≤ gece headroom "
-        f"**{maxinstall:.0f} kW**. Statik guvenli kurulum.")
+    st.warning(f"⚠️ Algoritma oncesi (bodoslama) tepe **{P['peak_naive']:.0f} kW** trafo "
+        f"anmasini (%{naive_peak_pct:.0f}) asiyor. Istasyon sayisini azaltin veya cesitlilik "
+        f"faktorunu dusurun (madde 9: algoritma oncesi bile overload olmamali).")
+if not (20.0 <= div_pct <= 30.0):
+    st.info(f"ℹ️ Cesitlilikli istasyon talebi trafo anmasinin **%{div_pct:.0f}**'i "
+        f"(hedef aralik %20-%30). Istasyon sayisini/cesitlilik faktorunu buna gore ayarlayin.")
 
 top = st.columns(4)
 top[0].metric(f"Toplam Tasarruf ({P['cfg_days']} gun)", fmt_tl(A["total_saving_tl"]))
@@ -348,13 +394,49 @@ with tabA:
         ax.legend(handles, labels, loc="upper left", fontsize=8, ncol=2)
         fig.tight_layout(); st.pyplot(fig); plt.close(fig)
 
-    with st.expander("⚡ Sarj Gucu Egrisi (±60 kW ramp etkisi)", expanded=False):
-        fig2, axc = plt.subplots(figsize=(12, 3.6))
-        axc.plot(x, chg_naive, color="#d93025", lw=2, label="Bodoslama (sicrayan)")
-        axc.plot(x, chg_opt, color="#1e8e3e", lw=2, label="Optimize (rampa ile yumusak)")
+    with st.expander("⚡ Sarj Egrisi · Algoritma Oncesi vs Sonrasi (madde 8)", expanded=True):
+        st.caption("Yalnizca SARJ gucu (baz yuk haric). Algoritma oncesi (bodoslama) "
+                   "sarj, araclar gelir gelmez sicrar; algoritma sonrasi ayni enerjiyi "
+                   "ramp ile yumusatip ucuz/dusuk-baz dakikalara yayar.")
+        fig2, axc = plt.subplots(figsize=(12, 3.8))
+        axc.fill_between(x, 0, chg_naive, color="#d93025", alpha=0.18, zorder=1)
+        axc.plot(x, chg_naive, color="#d93025", lw=2.2, label="Algoritma Oncesi (sarj)", zorder=3)
+        axc.fill_between(x, 0, chg_opt, color="#1e8e3e", alpha=0.18, zorder=2)
+        axc.plot(x, chg_opt, color="#1e8e3e", lw=2.2, label="Algoritma Sonrasi (sarj)", zorder=4)
         axc.set_xlabel("Saat"); axc.set_ylabel("Sarj Gucu (kW)")
         axc.set_xlim(0, 24); axc.set_xticks(range(0, 25, 2)); axc.grid(alpha=0.25)
-        axc.legend(fontsize=8); fig2.tight_layout(); st.pyplot(fig2); plt.close(fig2)
+        axc.legend(fontsize=9, loc="upper left"); fig2.tight_layout(); st.pyplot(fig2); plt.close(fig2)
+
+    # ---- madde 8: ARAC BAZLI SARJ SURELERI (secilen t gunu) ----
+    with st.expander("🚙 Arac Bazli Sarj Sureleri — Bu Gun (Algoritma Oncesi vs Sonrasi)", expanded=True):
+        st.caption(f"{day+1}. gun ({sel_date.strftime('%d.%m.%Y')}) icinde sarja giren her "
+                   "aracin algoritma ONCESI (bodoslama) ve SONRASI (optimize) sarj suresi. "
+                   "Algoritma, aracin KENDI fis-takili penceresi icinde gucu yayar; sure "
+                   "uzayabilir ama %80 tamamlanma korunur (S-kati taban ile sinirli).")
+        scmp = P["sessions_cmp"]
+        day_tbl = scmp[scmp["day"] == day].copy()
+        if len(day_tbl) == 0:
+            st.info("Bu gun sarja giren arac yok.")
+        else:
+            day_tbl["Uzama (dk)"] = (day_tbl["charge_duration_min_opt"]
+                                     - day_tbl["charge_duration_min_naive"])
+            show = pd.DataFrame({
+                "Arac ID": day_tbl["vehicle_id"].values,
+                "Model": day_tbl["model"].values,
+                "Sure — Oncesi (dk)": day_tbl["charge_duration_min_naive"].values,
+                "Sure — Sonrasi (dk)": day_tbl["charge_duration_min_opt"].values,
+                "Uzama (dk)": day_tbl["Uzama (dk)"].values,
+                "Tamam (Sonrasi)": np.where(day_tbl["completed_opt"].values, "✅", "—"),
+            }).sort_values("Sure — Sonrasi (dk)", ascending=False)
+            dcol = st.columns(3)
+            dcol[0].metric("Bu gun oturum", f"{len(day_tbl)}")
+            dcol[1].metric("Ort. sure — Oncesi", f"{np.nanmean(day_tbl['charge_duration_min_naive']):.0f} dk")
+            dcol[2].metric("Ort. sure — Sonrasi", f"{np.nanmean(day_tbl['charge_duration_min_opt']):.0f} dk",
+                           f"{np.nanmean(day_tbl['Uzama (dk)']):+.0f} dk ort. uzama")
+            st.dataframe(show.style.format({
+                "Sure — Oncesi (dk)": "{:.0f}", "Sure — Sonrasi (dk)": "{:.0f}",
+                "Uzama (dk)": "{:+.0f}",
+            }), use_container_width=True, hide_index=True, height=320)
 
     cost_naive = float(np.sum(chg_naive * dt * price_d))
     cost_opt = float(np.sum(chg_opt * dt * price_d))
@@ -382,24 +464,30 @@ with tabB:
     th_o = A["thermal_opt"]; th_n = A["thermal_naive"]; soh = A["soh"]
     days_axis = np.arange(P["cfg_days"]) + 1
 
-    with st.expander("🔥 Trafo Termal Omur Tuketimi (IEEE C57.91 benzeri)", expanded=True):
+    lp = A["life_proj"]; pj_o = lp["proj_opt"]; pj_n = lp["proj_naive"]
+    with st.expander("🔥 Trafo Termal Omru - IEC 60076-7 (gercek Ankara sicakliklari)", expanded=True):
+        st.caption(f"Sicak-nokta IEC 60076-7:2018 fark-denklemi modeliyle, GERCEK Ankara "
+                   f"ortam sicakligi (tepe ~{A['ambient_peak_c']:.0f}°C; Mayis-Agustos en kotu "
+                   f"pencere) altinda. Bagil yaslanma V = 2^((theta_h-98)/6) (normal kagit, 98C ref).")
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Tepe Sicak-Nokta (Once→Sonra)",
-                  f"{th_n['theta_hs_peak']:.0f}→{th_o['theta_hs_peak']:.0f} °C",
-                  help="110°C uzeri yalitimda hizlandirilmis yaslanma baslar.")
-        k2.metric("Esdeger Trafo Omru (Once→Sonra)",
-                  f"{th_n['equiv_life_years']:.0f}→{th_o['equiv_life_years']:.0f} yil",
-                  help="Termal yaslanmaya gore esdeger omur. Dusuk yuklenmede termal "
-                       "yaslanma ihmal edilebilir oldugundan deger, fiziksel tasarim omru "
-                       "(~30 yil) tavaniyla kirpilir; gercek omru nem/busing/OLTC gibi "
-                       "etkenler sinirlar. Iki senaryo arasindaki fark anlamlidir.")
-        k3.metric("Tuketilen Omur (Once→Sonra)",
-                  f"%{th_n['pct_life_consumed']:.4f}→%{th_o['pct_life_consumed']:.4f}")
-        k4.metric("Onlenen Yaslanma (100g / yillik)", fmt_tl(A["thermal_saving_tl"]),
-                  f"yillik ~{fmt_tl(A['thermal_saving_annual_tl'])}")
-        if th_n["theta_hs_peak"] >= 105.0:
-            st.warning(f"⚠️ Algoritmasiz tepe sicak-nokta **{th_n['theta_hs_peak']:.0f}°C** "
-                       f"ile 110°C sinirini zorluyor; optimize **{th_o['theta_hs_peak']:.0f}°C**'ye cekiyor.")
+        k1.metric("Tepe Sicak-Nokta (Once->Sonra)",
+                  f"{th_n['theta_hs_peak']:.0f}->{th_o['theta_hs_peak']:.0f} °C",
+                  help="IEC normal kagit referansi 98°C (V=1). Altinda yaslanma normalden yavastir.")
+        k2.metric("100 Gunde Tuketilen (Once->Sonra)",
+                  f"%{th_n['pct_life_consumed']:.4f}->%{th_o['pct_life_consumed']:.4f}",
+                  help="Simule edilen 100 gunluk (en kotu) penceredeki termal omur tuketimi.")
+        k3.metric("30 Yilda Tuketilen (Once->Sonra)",
+                  f"%{pj_n['pct_life_horizon']:.2f}->%{pj_o['pct_life_horizon']:.2f}",
+                  help=f"Madde 3: pencere yaslanmasi mevsimsel duzeltme (faktor "
+                       f"{lp['seasonal_factor']:.2f}) ile 30 yila tasinir.")
+        k4.metric("Ertelenen Trafo Degisim Maliyeti (30y)", fmt_tl(A["thermal_saving_tl"]),
+                  help="Madde 3: naive'in opt'a gore 30 yilda FAZLA tukettigi omur kesri "
+                       "x trafo maliyeti (4.000.000 TL).")
+        st.info(f"🧭 **Omur uzamasi (madde 3):** Dogru boyutlandirilmis (overload'suz) bu "
+                f"yuklenmede termal yaslanma cok dusuktur; trafo omru FIZIKSEL tasarim omru "
+                f"(~30 yil) ile baskilanir. Termal-esdeger omur ~{pj_n['equiv_life_thermal_years']:.0f} "
+                f"yil (once) -> ~{pj_o['equiv_life_thermal_years']:.0f} yil (sonra). Asil parasal "
+                f"karsilik, 30 yillik ufukta korunan omur kesridir: **{fmt_tl(A['thermal_saving_tl'])}**.")
         figt, axt = plt.subplots(figsize=(12, 3.8))
         axt.plot(days_axis, th_n["cum_aging_hours_daily"], color="#d93025", lw=2, label="Algoritmasiz")
         axt.plot(days_axis, th_o["cum_aging_hours_daily"], color="#1e8e3e", lw=2, label="Algoritmali")
@@ -462,7 +550,8 @@ with tabB:
     f = st.columns(4)
     f[0].metric("Enerji Tasarrufu", fmt_tl(A["energy_saving_tl"]))
     f[1].metric("Demand Charge Tasarrufu", fmt_tl(A["demand_saving_tl"]))
-    f[2].metric("Trafo Omru Tasarrufu", fmt_tl(A["thermal_saving_tl"]))
+    f[2].metric("Trafo Omru (30y ertelenen)", fmt_tl(A["thermal_saving_tl"]),
+                help="IEC 60076-7 termal omur; 30 yillik ufukta ertelenen trafo degisim maliyeti (madde 3).")
     f[3].metric("SOH (Batarya) Tasarrufu", fmt_tl(A["soh_saving_tl"]))
 
     # ---- B3: Çoklu-seed Monte Carlo (tasarruf dağılımı) ----
