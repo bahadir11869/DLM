@@ -29,7 +29,9 @@ from typing import List
 # --------------------------------------------------------------------------- #
 MINUTES_PER_DAY: int = 1440           # Simulasyon dakika bazli calisir.
 HOURS_PER_MINUTE: float = 1.0 / 60.0  # dt = 1/60 saat (kW -> kWh donusumu)
-DAYS_DEFAULT: int = 100               # 100 gun x 1440 dakika
+DAYS_PER_MONTH: int = 30              # Slider AY -> GUN donusumu (madde 1)
+MONTHS_DEFAULT: int = 6               # Varsayilan simulasyon suresi (ay)
+DAYS_DEFAULT: int = MONTHS_DEFAULT * DAYS_PER_MONTH   # 180 gun (~6 ay)
 
 
 # --------------------------------------------------------------------------- #
@@ -78,6 +80,16 @@ class StationConfig:
     #     aktif olarak trafo headroom'u icinde yonetir.
     diversity_factor: float = 0.60
 
+    # ALGORITMA-ONCESI (naive) TALEP MODELI (N1 - baz cizgisi durustlugu):
+    #   "diversity" -> esZamanli talep diversity_factor x kurulu_guc ile sinirli
+    #                  (talep TAHMINI; naive tepe buyuk olcude bu varsayima baglidir).
+    #   "event"     -> tavansiz OLAY-TABANLI ust-sinir: tum soketler taper'a gore
+    #                  serbest ceker (LMS yokken fiziksel olarak mumkun olan en kotu
+    #                  durum; overload MUMKUNDUR). Iki mod birlikte, naive tepenin
+    #                  belirsizlik BANDINI verir (sonuclar tek noktaya degil banda
+    #                  gore raporlanmalidir).
+    naive_mode: str = "diversity"
+
     # RAMPA HIZI KISITI (madde 4): EV sarj cihazlari icin "kW/dk" cinsinden ZORUNLU
     # bir standart YOKTUR; cihazin kendisi ISO 15118 / IEC 61851 ile saniyeler
     # icinde rampa yapabilir. Sinir, SAHA EMS'inin GUC KALITESI (gerilim
@@ -99,7 +111,7 @@ class StationConfig:
     target_soc: float = 0.80
 
     # MAKS SARJ UZATMA KATSAYISI (S) - madde 3:
-    # Algoritma bir araci, tam-guc (en kotu senaryo / bodoslama) ile gereken
+    # Algoritma bir araci, tam-guc (en kotu senaryo / algoritmasiz) ile gereken
     # sureye gore EN FAZLA S katina kadar uzatabilir. Anlik verilen guc, aracin
     # tam-guc kabiliyetinin 1/S'inin altina dusurulmez (guc tabani = p_hard / S).
     # Boylece DC hizinin avantaji korunur; aksi halde sure 400+ dk'ya cikip
@@ -210,6 +222,15 @@ class PricingConfig:
     ptf_solar_max: float = 1.00       # yuksek-solar gun -> gunduz penceresi ~0
     smf_spread: float = 350.0         # SMF'nin PTF'den sapma genligi (dengesizlik)
 
+    # AYLIK GUNES (SOLAR) FAKTORU (N4 - mevsimsel durustluk): gunduz PTF'sinin
+    # ~0'a inme derinligi mevsime baglidir. Ankara aylik kuresel isinim (GHI)
+    # mertebesine gore normalize edilmis carpan, Ocak..Aralik. Hem sentetik PTF
+    # uretiminde (solar_depth x ay faktoru) hem de enerji tasarrufunun yillik
+    # projeksiyon mevsim duzeltmesinde (energy_seasonal_factor) kullanilir.
+    monthly_solar_factor: tuple = (
+        0.30, 0.40, 0.55, 0.70, 0.85, 0.95, 1.00, 0.95, 0.80, 0.58, 0.38, 0.27,
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Trafo Termal Omur modeli (IEC 60076-7:2018) - madde 2
@@ -257,12 +278,18 @@ class ThermalConfig:
     hs_reference_c: float = 98.0          # IEC normal kagit referansi (V=1)
     aging_base: float = 2.0               # V = 2^((θh−98)/6)
     aging_doubling_k: float = 6.0         # her +6°C'de yaslanma ikiye katlanir
-    normal_life_hours: float = 180000.0   # 98°C referansta normal yalitim omru (≈20.5 yil)
+
+    # TRAFO NORMAL/TASARIM OMRU = 30 YIL (madde 2 - kullanici varsayimi):
+    # Trafonun omru, REFERANS yaslanma hizinda (V=1, sicak-nokta 98°C) 30 yil
+    # ALINIR. Yani toplam omur butcesi = 30 × 8760 = 262.800 esdeger-saattir.
+    # Tuketilen omur yuzdesi DAIMA bu 30 yillik butceye gore ifade edilir; boylece
+    # "30 yilda tuketilen omur" ve "bu donemde tuketilen omur" dogrudan 30 yila
+    # oranlanir. (Eski 180.000 saat/98°C IEC normal-omur referansi yerine.)
+    normal_life_hours: float = 262800.0   # = 30 yil × 8760 saat (30 yil referans omru)
 
     # FIZIKSEL TASARIM OMRU TAVANI (madde 2):
-    # Dusuk yuklenmede termal yaslanma ihmal edilebilir; IEC LoL "esdeger omru"
-    # fiziksel olmayan yuzlerce yila cikar. Esdeger omur, nem/busing/OLTC/mekanik
-    # etkenlerle sinirli fiziksel tasarim omruyle (30 yil) kirpilir.
+    # Trafonun fiziksel/tasarim omru 30 yildir (nem/busing/OLTC/mekanik). Termal
+    # esdeger omur bundan uzun cikabilir; gosterimde 30 yil tavaniyla kirpilir.
     design_life_years: float = 30.0
 
     # 30-YILLIK OMUR TUKETIMI EKSTRAPOLASYONU (madde 3):
@@ -307,6 +334,18 @@ class FinancialConfig:
     contracted_demand_kw: float = 1300.0
     # Aylik guc/demand bedeli (TL/kW/ay).
     demand_charge_tl_per_kw: float = 90.0
+    # GUC BEDELI REJIMI (N2 - mevzuat duzeltmesi):
+    #   "EPDK"   -> guc bedeli SOZLESME GUCU uzerinden SABIT tahakkuk eder (TR
+    #               uygulamasi). Tepe dususu yalnizca (i) ASIM CEZASINI azaltir ve
+    #               (ii) "daha dusuk sozlesme gucu secebilme" firsatini yaratir;
+    #               olculen tepe dustugu icin guc bedeli kendiliginden DUSMEZ.
+    #   "DEMAND" -> ABD-tarzi: olculen aylik tepe x birim bedel (eski davranis;
+    #               karsilastirma/duyarlilik icin secilebilir).
+    billing_mode: str = "EPDK"
+    # TEPE OLCUM PERIYODU (N3): EPDK/OSOS sayaclari tepe gucu 15 DAKIKALIK
+    # ORTALAMA uzerinden olcer; dakikalik anlik tepe kullanmak cezayi/tasarrufu
+    # sistematik sisirir. Demand/ceza hesabi bu periyodun ortalamasiyla yapilir.
+    demand_interval_min: int = 15
     # GUC ASIM BEDELI: EPDK "Elektrik Piyasasi Tarifeler Yonetmeligi" uyarinca
     # sozlesme gucunu asan abone, asilan guc icin guc bedelinin KATI tutarinda
     # ceza oder. Tipik uygulama, asim donemi icin guc bedelinin ~3 katidir
@@ -314,6 +353,12 @@ class FinancialConfig:
     demand_penalty_multiplier: float = 3.0
     # Senaryo-7 icin baz yuk artis orani (baz +%15 karsilastirmasi).
     base_increase_pct: float = 0.15
+
+    # USD/TRY KURU (madde 2): trafo ve diger maliyetleri DOLAR cinsinden de
+    # gostermek icin. Trafo ekipmani genelde doviz endeksli fiyatlanir; bu kur
+    # ile TL maliyetler dolara cevrilir (guncel piyasa kuruna gore degistirilebilir).
+    # Guncelleme: 11.06.2026 piyasa kuru ~46.15 TL/USD.
+    usd_try_rate: float = 46.15
 
     @property
     def demand_penalty_tl_per_kw(self) -> float:
@@ -351,7 +396,7 @@ class ScenarioConfig:
     name: str = "FABRIKA"   # "AVM" veya "FABRIKA"
 
     # Kalici arac filosu buyuklugu (kumulatif SOH analizi icin sabit kimlikler).
-    # Filo, soketleri kuyrukla doyuracak kadar buyuk tutulur; boylece BODOSLAMA
+    # Filo, soketleri kuyrukla doyuracak kadar buyuk tutulur; boylece algoritmasiz
     # stratejisi yuksek baz-yuk saatlerinde trafoyu SUREKLI asiri yukler (overload)
     # ve termal yaslanma farki olculebilir hale gelir.
     fleet_size_avm: int = 80         # duzenli musteri havuzu
@@ -366,6 +411,13 @@ class ScenarioConfig:
 
     # Dashboard'dan elle ayarlanan arac sayisi (0 -> senaryo varsayilani kullanilir)
     fleet_size_override: int = 0
+
+    # CIKIS SAATI BELIRSIZLIGI (N7 - operasyonel gerceklik): gercek sahada
+    # optimizer aracin cikis saatini TAM bilemez (kullanici beyani/tahmin).
+    # Planlama, tahmini cikis = gercek cikis + N(0, sigma) ile yapilir (dk).
+    # 0 = tam bilgi (gun-oncesi kesin beyan varsayimi). Fiziksel cikis daima
+    # GERCEK saattir; tahmin hatasi tamamlanma oranini dusurebilir (raporlanir).
+    dep_uncertainty_min: float = 0.0
 
     @property
     def is_factory(self) -> bool:
@@ -398,7 +450,7 @@ class SimConfig:
     #   "always"    -> algoritma her dakika calisir.
     #   "peak_only" -> algoritma SADECE trafo doluluk orani (baz_yuk/anma)
     #                  peak_loading_threshold'u astiginda devreye girer; aksi
-    #                  halde sistem bodoslama (yonetimsiz, tam guc) gibi davranir.
+    #                  halde sistem algoritmasiz (yonetimsiz, tam guc) gibi davranir.
     activation_mode: str = "always"
     peak_loading_threshold: float = 0.60   # %60 trafo doluluk -> "puant"
 

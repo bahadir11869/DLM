@@ -10,7 +10,7 @@ Iki strateji:
                    akilli dagitim = IEC 60364-7-722 anlamindaki Yuk Yonetim Sistemi
                    (LMS). Toplam yuku (baz+sarj) trafo/sozlesme gucunun ustune
                    cikarmaz -> peak-shaving + termal koruma + maliyet.
-  2) "naive"     : "klasik bodoslama" - aktif yuk yonetimi YOK. Araclar gelir gelmez
+  2) "naive"     : "klasik algoritmasiz" - aktif yuk yonetimi YOK. Araclar gelir gelmez
                    sarj olur; ramp/fiyat/C-rate yok. Tek gercekci kisit, elektrik
                    mevzuatindaki CESITLILIK (esZamanlilik) faktorudur: esZamanli
                    istasyon talebi diversity_factor × kurulu_guc ile sinirlidir
@@ -45,7 +45,7 @@ Her t dakikasinda HARD CONSTRAINT olarak:
     C(t) = max(0, rated_kw * opt_max_loading_pu - base_load(t))
 Yani optimize strateji, baz yukun trafoda biraktigi bos kapasiteyi kullanir
 ve toplami trafo anma gucunun (opt_max_loading_pu ile) USTUNE cikarmaz.
-Bodoslama bu kisiti uygulamaz; toplam yuk trafoyu asabilir (overload).
+algoritmasiz bu kisiti uygulamaz; toplam yuk trafoyu asabilir (overload).
 
 Performans: dis zaman dongusu (ramp/durum bagimliligi) kacinilmazdir; her
 dakikadaki arac-bazli hesaplar NumPy ile vektorizedir, es zamanli arac sayisi
@@ -175,6 +175,16 @@ def simulate(
     eneed = s["energy_need_kwh"].to_numpy(np.float64)   # oturum toplam enerji ihtiyaci (kWh)
     soc = s["arrival_soc"].to_numpy(np.float64).copy()
 
+    # CIKIS SAATI BELIRSIZLIGI (N7): planlama, TAHMINI cikis saatiyle yapilir
+    # (gercek cikis + N(0, sigma)); fiziksel cikis (soketten ayrilma, kuyruk)
+    # daima GERCEK dep ile olur. sigma=0 -> tam bilgi (kesin beyan varsayimi).
+    dep_plan = dep
+    dep_sigma = float(getattr(cfg.scenario, "dep_uncertainty_min", 0.0) or 0.0)
+    if is_opt and dep_sigma > 0.0:
+        rng_dep = np.random.default_rng(cfg.seed + 911)
+        noise = np.round(rng_dep.normal(0.0, dep_sigma, size=n)).astype(np.int64)
+        dep_plan = np.maximum(dep + noise, arr + 1)
+
     delivered = np.zeros(n)
     stress_thr = np.zeros(n)
     start_min = np.full(n, -1, np.int64)
@@ -258,11 +268,11 @@ def simulate(
         # sinirla. Boylece "gecikme yuzdesi" ~ (S-1)x100 ile sinirli kalir; algoritma
         # trafo bos olsa bile gucu sonsuza kadar yayip sureyi 4-5 katina cikaramaz.
         #   t_naive ≈ enerji / (min(dc,soket)*0.85)   (taper dahil yaklasik tam-guc)
-        #   eff_dep = baslangic + S * t_naive   (gercek cikistan once)
+        #   eff_dep = baslangic + S * t_naive   (TAHMINI cikistan once - N7)
         avg_full_pow = np.minimum(hw[veh], sock_cap[occ]) * 0.85
         t_naive_min = eneed[veh] / np.maximum(avg_full_pow, 1e-9) / dt   # dakika
         sm = np.where(start_min[veh] >= 0, start_min[veh], t)
-        eff_dep = np.minimum(dep[veh], sm + np.ceil(stretch * t_naive_min)).astype(np.int64)
+        eff_dep = np.minimum(dep_plan[veh], sm + np.ceil(stretch * t_naive_min)).astype(np.int64)
         eff_dep = np.maximum(eff_dep, t + 1)
 
         # ACILIYET GUCU (eff_dep'e yetisme): aracin %80'e ulasmasi icin gereken
@@ -310,7 +320,7 @@ def simulate(
             # (alloc batarya gucudur; sebeke = alloc/eff). Boylece baz+sarj(sebeke) <= cap_kw.
             C_t = max(0.0, cap_kw - base_load[t]) * eff
         else:
-            # Bodoslama (naive): aktif LMS yok; trafo limiti/sozlesme/ramp/C-rate YOK.
+            # algoritmasiz (naive): aktif LMS yok; trafo limiti/sozlesme/ramp/C-rate YOK.
             # Tek gercekci kisit: CESITLILIK faktorlu esZamanli talep (asagida T_t).
             pmax = p_hard
             C_t = float(pmax.sum())
@@ -348,7 +358,7 @@ def simulate(
 
             T_des = float((p_urgent + p_opp).sum())
 
-            # 3) ±60 kW RAMP LIMITI
+            # 3) RAMP LIMITI (kurulu gucun %10'u/dk - madde 4)
             T_ramp = min(max(T_des, prev_total - ramp), prev_total + ramp)
             # 4) Fiziksel/trafo tavanlari
             T_t = float(np.clip(T_ramp, 0.0, min(C_t, float(pmax.sum()))))
@@ -391,11 +401,17 @@ def simulate(
             T_t = float(np.clip(T_ramp, 0.0, min(C_t, float(pmax.sum()))))
             alloc = _waterfill(T_t, pmax, pmax)
         else:
-            # BODOSLAMA / naive: ramp/fiyat/trafo/C-rate YOK. Tek kisit, gercekci
-            # ESZAMANLILIK (cesitlilik) faktorudur (madde 6/9): esZamanli batarya
-            # talebi div_cap_batt (= diversity×kurulu×verim) ile sinirlanir. Bu,
-            # "LMS yok ama tum soketler ayni anda tam guce ulasmaz" demand-tahminidir.
-            T_t = min(float(pmax.sum()), div_cap_batt)
+            # algoritmasiz / naive: ramp/fiyat/trafo/C-rate YOK. Iki mod (N1):
+            #   "diversity" -> esZamanli batarya talebi div_cap_batt
+            #                  (= diversity×kurulu×verim) ile sinirlanir. Bu bir
+            #                  TALEP TAHMINIDIR (varsayim), fiziksel kisit degil.
+            #   "event"     -> tavansiz olay-tabanli UST SINIR: soketler taper'a
+            #                  gore serbest ceker; overload mumkundur. Iki mod,
+            #                  naive tepenin belirsizlik bandini verir.
+            if st.naive_mode == "event":
+                T_t = float(pmax.sum())
+            else:
+                T_t = min(float(pmax.sum()), div_cap_batt)
             alloc = _waterfill(T_t, pmax, pmax)
 
         # (f) entegrasyon. alloc = BATARYA tarafi guc (kW); SEBEKE = alloc/eff (A4).
@@ -432,7 +448,7 @@ def simulate(
 
 
 def run_both(cfg, sessions, base_load, price_tl_kwh, weights) -> Dict[str, SimResult]:
-    """Optimize ve bodoslama stratejilerini ayni veriyle calistirir."""
+    """Optimize ve algoritmasiz stratejilerini ayni veriyle calistirir."""
     return {
         "optimized": simulate(cfg, sessions, base_load, price_tl_kwh, weights, "optimized"),
         "naive": simulate(cfg, sessions, base_load, price_tl_kwh, weights, "naive"),

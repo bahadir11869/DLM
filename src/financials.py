@@ -26,7 +26,7 @@ import pandas as pd
 
 from .config import SimConfig, MINUTES_PER_DAY, HOURS_PER_MINUTE
 from .optimizer import SimResult
-from .data_generator import ambient_series, seasonal_aging_factor
+from .data_generator import ambient_series, seasonal_aging_factor, energy_seasonal_factor
 
 
 # --------------------------------------------------------------------------- #
@@ -326,23 +326,43 @@ def summarize_costs(cfg: SimConfig, res: SimResult) -> Dict[str, float]:
     energy_cost = float(np.sum(energy_kwh_min * res.price_tl_kwh))
 
     facility = res.facility_kw
-    # AYLIK demand charge: her 30-gunluk blogun TEPE gucu uzerinden. KISMI (eksik)
-    # son ay, gun orani (frac) kadar AGIRLIKLANIR (madde 4 - maliyet hatasi).
-    # Boylece donem demand maliyeti GERCEK ay sayisiyla (days/30) orantili olur ve
-    # full_analysis'teki yillik projeksiyon (x365/days) TUTARLI kalir. Eski kod
-    # 100 gun icin 4 TAM ay sayip, sonra x3.65 ile yilda ~14.6 ay'a sisiriyordu.
-    block = 30 * MINUTES_PER_DAY
-    n_blocks = max(1, int(np.ceil(len(facility) / block)))
+    # TEPE OLCUMU (N3): EPDK/OSOS sayaclari tepe gucu 15 DAKIKALIK ORTALAMA
+    # uzerinden olcer (demand_interval_min). Dakikalik anlik tepe yerine bu
+    # ortalama kullanilir; kisa sivri tepeler torpulenir, ceza/tasarruf sismez.
+    iv = max(1, int(fin.demand_interval_min))
+    n_iv = len(facility) // iv
+    if n_iv > 0:
+        fac_iv = facility[:n_iv * iv].reshape(n_iv, iv).mean(axis=1)
+    else:
+        fac_iv = facility
+    peak_iv_overall = float(fac_iv.max()) if len(fac_iv) else 0.0
+
+    # AYLIK demand/ceza: her 30-gunluk blok; KISMI son ay gun orani (frac) kadar
+    # agirlanir (yillik projeksiyon x365/gun ile tutarli kalir).
+    #
+    # GUC BEDELI REJIMI (N2):
+    #   EPDK   -> guc bedeli = SOZLESME GUCU x birim bedel (SABIT; olculen tepeden
+    #             bagimsiz -> iki stratejide AYNI, tasarruf yalnizca CEZA farkidir.
+    #             Tepe dususunun ikinci getirisi "daha dusuk sozlesme gucu
+    #             secebilme"dir; o ayri kalemde raporlanir).
+    #   DEMAND -> olculen aylik 15-dk tepe x birim bedel (ABD-tarzi, eski davranis).
+    epdk_mode = str(fin.billing_mode).upper() != "DEMAND"
+    contracted = float(fin.contracted_demand_kw)
+    block_iv = (30 * MINUTES_PER_DAY) // iv
+    n_blocks = max(1, int(np.ceil(len(fac_iv) / block_iv)))
     demand_base = 0.0
     demand_penalty = 0.0
     for mm in range(n_blocks):
-        seg = facility[mm * block:(mm + 1) * block]
+        seg = fac_iv[mm * block_iv:(mm + 1) * block_iv]
         if seg.size == 0:
             continue
-        pk = float(seg.max())
-        frac = seg.size / block          # kismi ay agirligi (0..1)
-        demand_base += pk * fin.demand_charge_tl_per_kw * frac
-        demand_penalty += max(0.0, pk - fin.contracted_demand_kw) * fin.demand_penalty_tl_per_kw * frac
+        pk = float(seg.max())                # aylik 15-dk ortalama tepe
+        frac = seg.size / block_iv           # kismi ay agirligi (0..1)
+        if epdk_mode:
+            demand_base += contracted * fin.demand_charge_tl_per_kw * frac
+        else:
+            demand_base += pk * fin.demand_charge_tl_per_kw * frac
+        demand_penalty += max(0.0, pk - contracted) * fin.demand_penalty_tl_per_kw * frac
     demand_base = float(demand_base)
     demand_penalty = float(demand_penalty)
 
@@ -354,7 +374,9 @@ def summarize_costs(cfg: SimConfig, res: SimResult) -> Dict[str, float]:
         "demand_base_cost_tl": demand_base,
         "demand_penalty_tl": demand_penalty,
         "demand_cost_tl": demand_base + demand_penalty,
+        "billing_mode": "EPDK" if epdk_mode else "DEMAND",
         "peak_facility_kw": float(facility.max()),
+        "peak_15min_kw": peak_iv_overall,
         "completion_rate": float(sess["completed"].mean()) if len(sess) else 0.0,
         "avg_charge_duration_min": float(np.nanmean(sess["charge_duration_min"].values)) if len(sess) else float("nan"),
         "n_sessions": int(len(sess)),
@@ -380,13 +402,20 @@ def power_shaving_roi(cfg: SimConfig, peak_opt: float, peak_naive: float) -> Dic
     # Desteklenen EV sayisi artisi (~istasyon basina kapasite orani)
     ev_increase_pct = (extra_stations / max(st.n_sockets, 1)) * 100.0
 
+    # N6: anlatim, modelin kendi sonucuyla hizali tutulur. Dogru boyutlandirilmis
+    # (overload'suz) sistemde TERMAL omur kazanci kucuktur; trafo-tarafi parasal
+    # deger ASIM CEZASININ onlenmesi + dusuk sozlesme gucu + BUYUME headroom'udur.
+    # Ilave istasyon/EV rakamlari, yeni talebin de DLM tavani ALTINDA yonetilmesi
+    # kosuluna baglidir (kosulsuz "bedava kapasite" degildir).
     text = (
-        f"Trafo tepe yukunde **%{shave_pct:.0f}** ({shave_kw:.0f} kW) tirasama yapildi. "
-        f"Bu sayede milyonluk trafo yenileme yatirimi ertelenerek uretim bandi "
-        f"kapasitesini buyutebilecek **{headroom_kw:.0f} kW** boşluk (headroom) yaratildi. "
-        f"Olusturulan rezerv yuk ile sisteme ilave **{extra_stations} adet** DC sarj "
-        f"istasyonu entegre edilebilir ve desteklenen elektrikli arac sayisi "
-        f"**%{ev_increase_pct:.0f}** artirilabilir."
+        f"Trafo tepe yukunde **%{shave_pct:.0f}** ({shave_kw:.0f} kW) tirasama yapildi; "
+        f"ayni trafoda **{headroom_kw:.0f} kW** buyume payi (headroom) olustu. Bu pay, "
+        f"yeni talebin de DLM tavani altinda yonetilmesi KOSULUYLA ilave "
+        f"**{extra_stations} adet** DC istasyona (veya esdeger baz yuk buyumesine) alan "
+        f"acar; desteklenen EV kapasitesi **%{ev_increase_pct:.0f}** artirilabilir. "
+        f"Trafo-tarafi parasal kazanc, guc asim cezalarinin onlenmesi ve sozlesme "
+        f"gucunun dusuk tutulabilmesidir (bu boyutlandirmada termal omur kazanci "
+        f"kucuktur; ayrintisi termal bolumde)."
     )
     return {
         "shave_kw": shave_kw,
@@ -417,15 +446,40 @@ def full_analysis(cfg: SimConfig, fleet: pd.DataFrame,
 
     energy_saving = c_naive["energy_cost_tl"] - c_opt["energy_cost_tl"]
     demand_saving = c_naive["demand_cost_tl"] - c_opt["demand_cost_tl"]
-    # TRAFO TASARRUFU (madde 3): pencere yaslanma farki yerine 30 yillik ufukta
-    # ERTELENEN DEGISIM MALIYETI kullanilir (ortalama trafo omru boyunca DLM).
-    thermal_saving = life_proj["deferred_replacement_tl"]
-    thermal_saving_window = th_naive["aging_cost_tl"] - th_opt["aging_cost_tl"]
+    # TRAFO OMUR TASARRUFU (madde 2): bu SIMULASYON DONEMINDE tuketilen omrun
+    # algoritma ONCESI - SONRASI farki, 30 yillik omur butcesine (262.800 saat)
+    # oranlanip TRAFO MALIYETI ile carpilir:
+    #   tasarruf = (tuketilen_omur%_naive − tuketilen_omur%_opt) × trafo_maliyeti
+    # (aging_cost_tl zaten pencere_lol/normal_life × trafo_maliyeti'dir.)
+    thermal_saving = th_naive["aging_cost_tl"] - th_opt["aging_cost_tl"]
+    thermal_saving_deferred = life_proj["deferred_replacement_tl"]   # 30y projeksiyon (referans)
+
+    # SOH ROI ATAMASI (N5): batarya kimin mali? FABRIKA/filo senaryosunda araclar
+    # tesis sahibinindir -> SOH kazanci OPERATOR ROI'sine girer. AVM senaryosunda
+    # bataryalar MUSTERININDIR -> operator toplamina YAZILMAZ; ayri "musteri
+    # faydasi" kalemi olarak raporlanir. (SOH modeli ad-hoc k=0.6 katsayisiyla
+    # GOSTERGE niteligindedir; kalibrasyon yol haritasi Faz 3.)
     soh_saving = soh["delayed_replacement_value_tl"]
-    total_saving = energy_saving + demand_saving + thermal_saving + soh_saving
+    soh_in_operator_roi = bool(cfg.scenario.is_factory)
+    operator_soh_saving = soh_saving if soh_in_operator_roi else 0.0
+    total_saving = energy_saving + demand_saving + thermal_saving + operator_soh_saving
 
     days = cfg.days
     annual = 365.0 / max(days, 1)
+
+    # YILLIK PROJEKSIYON MEVSIM DUZELTMELERI (N4): yaz penceresinden duz
+    # x365/gun ekstrapolasyon iyimserdir. Kalem bazinda duzeltme:
+    #   enerji -> energy_seasonal_factor (solar makasi kisin sigdir),
+    #   termal -> seasonal_aging_factor (kis ortaminda V ustel kuculur),
+    #   demand/ceza -> aylik yapi; lineer birakildi,
+    #   SOH -> throughput surumlu, mevsimden ~bagimsiz; lineer.
+    f_energy = energy_seasonal_factor(cfg)
+    f_thermal = life_proj["seasonal_factor"]
+    annual_energy = energy_saving * annual * f_energy
+    annual_demand = demand_saving * annual
+    annual_thermal = thermal_saving * annual * f_thermal
+    annual_soh = operator_soh_saving * annual
+    annual_total = annual_energy + annual_demand + annual_thermal + annual_soh
 
     return {
         "costs_opt": c_opt, "costs_naive": c_naive,
@@ -435,10 +489,17 @@ def full_analysis(cfg: SimConfig, fleet: pd.DataFrame,
         "soh": soh, "roi": roi,
         "energy_saving_tl": energy_saving,
         "demand_saving_tl": demand_saving,
-        "thermal_saving_tl": thermal_saving,                 # 30 yil ertelenen maliyet
-        "thermal_saving_window_tl": thermal_saving_window,   # pencere (100 gun) farki
+        "thermal_saving_tl": thermal_saving,                 # bu donem omur tuketim farki × maliyet
+        "thermal_saving_deferred_tl": thermal_saving_deferred,  # 30y projeksiyon (referans)
         "thermal_life_extension_years": life_proj["life_extension_years"],
-        "soh_saving_tl": soh_saving,
+        "soh_saving_tl": soh_saving,                         # ham SOH kazanci (gosterge)
+        "soh_in_operator_roi": soh_in_operator_roi,          # N5: operator ROI'sine dahil mi
+        "operator_soh_saving_tl": operator_soh_saving,
         "total_saving_tl": total_saving,
-        "annual_total_saving_tl": total_saving * annual,
+        "energy_seasonal_factor": f_energy,
+        "annual_energy_saving_tl": annual_energy,
+        "annual_demand_saving_tl": annual_demand,
+        "annual_thermal_saving_tl": annual_thermal,
+        "annual_soh_saving_tl": annual_soh,
+        "annual_total_saving_tl": annual_total,
     }

@@ -132,15 +132,43 @@ def _const_res(cfg, facility_value):
     return SimResult("optimized", np.zeros(T), np.zeros(T), fac, np.zeros(T), np.zeros(T), sess)
 
 
-def test_demand_charge_fractional_month():
+def test_demand_charge_fractional_month_epdk():
+    # N2: varsayilan EPDK rejimi -> guc bedeli SOZLESME GUCU uzerinden sabit
+    # (olculen tepeden bagimsiz); kismi ay yine gun oraniyla agirlanir.
     c30 = SimConfig(days=30)
     c15 = SimConfig(days=15)
     d30 = summarize_costs(c30, _const_res(c30, 1000.0))["demand_base_cost_tl"]
     d15 = summarize_costs(c15, _const_res(c15, 1000.0))["demand_base_cost_tl"]
-    # 15 gun = yarim ay -> yari demand bedeli (lineer, yillik projeksiyon tutarli)
+    contracted = c30.financial.contracted_demand_kw
     assert abs(d15 - 0.5 * d30) < 1e-6
-    # 30 gun = 1 tam ay: tepe(1000) x 90 TL/kW x 1 ay
-    assert abs(d30 - 1000.0 * 90.0) < 1e-6
+    # 30 gun = 1 tam ay: SOZLESME(1300) x 90 TL/kW x 1 ay (tepe 1000 olsa bile)
+    assert abs(d30 - contracted * 90.0) < 1e-6
+
+
+def test_demand_charge_demand_mode_peak_based():
+    # Eski ABD-tarzi rejim secilirse olculen (15-dk ortalama) tepe faturalanir.
+    cfg = SimConfig(days=30)
+    cfg.financial.billing_mode = "DEMAND"
+    d = summarize_costs(cfg, _const_res(cfg, 1000.0))
+    assert abs(d["demand_base_cost_tl"] - 1000.0 * 90.0) < 1e-6
+    # sabit 1000 kW profilde 15-dk ortalama tepe de 1000'dir
+    assert abs(d["peak_15min_kw"] - 1000.0) < 1e-6
+
+
+def test_demand_peak_uses_15min_average():
+    # N3: tek dakikalik sivri tepe (3000 kW) 15-dk ortalamada torpulenir; ceza
+    # anlik tepeye gore degil 15-dk ortalamaya gore hesaplanmali.
+    cfg = SimConfig(days=30)
+    T = cfg.total_minutes
+    sess = pd.DataFrame({"completed": [True], "charge_duration_min": [30.0]})
+    fac = np.full(T, 1000.0)
+    fac[100] = 3000.0                      # 1 dakikalik spike (>> sozlesme 1300)
+    res = SimResult("optimized", np.zeros(T), np.zeros(T), fac, np.zeros(T), np.zeros(T), sess)
+    d = summarize_costs(cfg, res)
+    avg15 = (3000.0 + 14 * 1000.0) / 15.0  # ~1133 kW < 1300 -> ceza yok
+    assert abs(d["peak_15min_kw"] - avg15) < 1e-6
+    assert d["demand_penalty_tl"] == 0.0
+    assert d["peak_facility_kw"] == 3000.0  # fiziksel anlik tepe ayrica raporlanir
 
 
 # --------------------------------------------------------------------------- #
@@ -225,6 +253,72 @@ def test_diversified_demand_in_target_band_default():
     st = StationConfig()
     pct = st.diversified_demand_kw / st.rated_kw * 100.0
     assert 18.0 <= pct <= 32.0
+
+
+def test_event_naive_exceeds_diversity_cap():
+    # N1: olay-tabanli naive (ust-sinir) cesitlilik tavanini asabilmeli; ayni
+    # veriyle diversity-modlu naive tavanin altinda kalmali.
+    base_kw = dict(days=10, seed=7,
+                   scenario=ScenarioConfig(name="FABRIKA", fleet_size_override=30),
+                   weights=Weights(0.5, 0.5, 0.5))
+    cfg_div = SimConfig(station=StationConfig(naive_mode="diversity"), **base_kw)
+    cfg_evt = SimConfig(station=StationConfig(naive_mode="event"), **base_kw)
+    fleet, sessions, base, ptf, smf = build_dataset(cfg_div, save=False)
+    price = build_price_signal(cfg_div, ptf, smf)
+    nv_div = simulate(cfg_div, sessions, base, price, cfg_div.weights, "naive")
+    nv_evt = simulate(cfg_evt, sessions, base, price, cfg_evt.weights, "naive")
+    cap = cfg_div.station.diversity_factor * cfg_div.station.installed_kw
+    assert float(nv_div.charging_kw.max()) <= cap + 1.0
+    assert float(nv_evt.charging_kw.max()) > cap + 1.0   # tavansiz ust-sinir
+
+
+def test_energy_seasonal_factor_below_one_summer_window():
+    # N4: yaz penceresi (Mayis baslangic) icin enerji mevsim faktoru < 1 olmali
+    # (yillik projeksiyon, yaz arbitraj makasini yila tasirken torpulenir).
+    from src.data_generator import energy_seasonal_factor
+    cfg = SimConfig(days=180)
+    f = energy_seasonal_factor(cfg)
+    assert 0.5 < f < 1.0
+
+
+def test_dep_uncertainty_degrades_gracefully():
+    # N7: cikis saati belirsizligi altinda simulasyon calismali; tamamlanma
+    # makul kalmali (S-kati taban guvencesi) ama kehanetli kosumdan iyi olamaz.
+    cfg0 = SimConfig(days=10, seed=7,
+                     scenario=ScenarioConfig(name="FABRIKA", fleet_size_override=20),
+                     weights=Weights(0.5, 0.5, 0.5))
+    fleet, sessions, base, ptf, smf = build_dataset(cfg0, save=False)
+    price = build_price_signal(cfg0, ptf, smf)
+    exact = simulate(cfg0, sessions, base, price, cfg0.weights, "optimized")
+    cfg_u = SimConfig(days=10, seed=7,
+                      scenario=ScenarioConfig(name="FABRIKA", fleet_size_override=20,
+                                              dep_uncertainty_min=60.0),
+                      weights=Weights(0.5, 0.5, 0.5))
+    noisy = simulate(cfg_u, sessions, base, price, cfg_u.weights, "optimized")
+    comp_exact = float(exact.sessions["completed"].mean())
+    comp_noisy = float(noisy.sessions["completed"].mean())
+    assert comp_noisy > 0.80                      # cokmemeli
+    assert comp_noisy <= comp_exact + 0.02        # kehanetten belirgin iyi olamaz
+
+
+def test_thermal_saving_grows_with_base_load():
+    # Baz yuk arttikca sicak-nokta yukselir; yaslanma ustel oldugu icin
+    # algoritmanin TERMAL tasarrufu (naive-opt yaslanma maliyeti farki) da artmali.
+    from src.financials import thermal_loss_of_life
+    from src.data_generator import ambient_series
+    cfg = SimConfig(days=10, seed=7,
+                    scenario=ScenarioConfig(name="FABRIKA", fleet_size_override=20),
+                    weights=Weights(0.5, 0.5, 0.5))
+    fleet, sessions, base, ptf, smf = build_dataset(cfg, save=False)
+    price = build_price_signal(cfg, ptf, smf)
+    amb = ambient_series(cfg)
+    savings = []
+    for mult in (1.0, 1.2):
+        res = run_both(cfg, sessions, base * mult, price, cfg.weights)
+        tn = thermal_loss_of_life(cfg, res["naive"].facility_kw, amb)
+        to = thermal_loss_of_life(cfg, res["optimized"].facility_kw, amb)
+        savings.append(tn["aging_cost_tl"] - to["aging_cost_tl"])
+    assert savings[1] > savings[0]
 
 
 def test_ramp_scales_with_installed_power():

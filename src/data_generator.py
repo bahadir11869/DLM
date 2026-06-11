@@ -201,12 +201,84 @@ def seasonal_aging_factor(cfg: SimConfig) -> float:
     return year_metric / max(win_metric, 1e-9)
 
 
+def energy_seasonal_factor(cfg: SimConfig) -> float:
+    """
+    ENERJI TASARRUFU MEVSIM FAKTORU (N4 - yillik projeksiyon durustlugu).
+
+    Enerji arbitraj tasarrufu gun-ici fiyat makasina baglidir. Makasin iki
+    bileseni vardir:
+      (a) aksam puant kacinmasi  -> yil boyu ~sabit (kis aksam puanti da yuksek),
+      (b) ucuz gunduz (solar~0) penceresinin derinligi -> mevsime bagli (kis sig).
+    Yaklasik vekil (proxy): proxy(ay) = 0.5 + 0.5 x solar_f(ay)  (esit agirlik).
+        faktor = <proxy>_yil / <proxy>_pencere      (yaz penceresi icin < 1)
+    Yillik enerji tasarrufu = donem_tasarrufu x (365/gun) x faktor. Boylece yaz
+    penceresinden duz x365/gun ekstrapolasyonun iyimserligi torpulenir (termal
+    kalemdeki seasonal_aging_factor'un enerji karsiligi).
+    """
+    pc = cfg.pricing
+    msf = np.asarray(pc.monthly_solar_factor, dtype=np.float64)
+    proxy = 0.5 + 0.5 * msf
+
+    year_vals = []
+    for mo in range(1, 13):
+        year_vals.extend([proxy[mo - 1]] * _days_in_month(2025, mo))
+    year_metric = float(np.mean(year_vals))
+
+    start = _sim_start_date(cfg)
+    win_vals = [proxy[(start + _dt.timedelta(days=int(d))).month - 1] for d in range(cfg.days)]
+    win_metric = float(np.mean(win_vals))
+    return year_metric / max(win_metric, 1e-9)
+
+
 def _days_in_month(year: int, month: int) -> int:
     if month == 12:
         nxt = _dt.date(year + 1, 1, 1)
     else:
         nxt = _dt.date(year, month + 1, 1)
     return (nxt - _dt.date(year, month, 1)).days
+
+
+# --------------------------------------------------------------------------- #
+# 2c) TURKIYE RESMI TATILLERI (madde 3) - baz yuk profiline girer
+# --------------------------------------------------------------------------- #
+# SABIT ulusal/resmi tatiller (ay, gun) - her yil ayni tarih.
+_FIXED_HOLIDAYS = {
+    (1, 1),    # Yilbasi
+    (4, 23),   # Ulusal Egemenlik ve Cocuk Bayrami
+    (5, 1),    # Emek ve Dayanisma Gunu
+    (5, 19),   # Ataturk'u Anma, Genclik ve Spor Bayrami
+    (7, 15),   # Demokrasi ve Milli Birlik Gunu
+    (8, 30),   # Zafer Bayrami
+    (10, 29),  # Cumhuriyet Bayrami
+}
+# DINI bayramlar (Ramazan/Kurban) her yil kayar -> yila gore (ay, gun) listesi.
+# Arife gunleri dahil; 2025-2026 resmi takvimine gore.
+_RELIGIOUS_HOLIDAYS = {
+    2025: {
+        (3, 29), (3, 30), (3, 31), (4, 1),            # Ramazan Bayrami 2025 (+arife)
+        (6, 5), (6, 6), (6, 7), (6, 8), (6, 9),       # Kurban Bayrami 2025 (+arife)
+    },
+    2026: {
+        (3, 19), (3, 20), (3, 21), (3, 22),           # Ramazan Bayrami 2026 (+arife)
+        (5, 26), (5, 27), (5, 28), (5, 29), (5, 30),  # Kurban Bayrami 2026 (+arife)
+    },
+}
+
+
+def is_turkish_holiday(d: _dt.date) -> bool:
+    """Verilen takvim gununun Turkiye resmi tatili olup olmadigi (madde 3)."""
+    if (d.month, d.day) in _FIXED_HOLIDAYS:
+        return True
+    return (d.month, d.day) in _RELIGIOUS_HOLIDAYS.get(d.year, set())
+
+
+def holiday_mask(cfg: SimConfig) -> np.ndarray:
+    """Simulasyon penceresi icin gun-bazli resmi tatil maskesi (shape: days,)."""
+    start = _sim_start_date(cfg)
+    return np.array(
+        [is_turkish_holiday(start + _dt.timedelta(days=int(d))) for d in range(cfg.days)],
+        dtype=bool,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -236,10 +308,15 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
     weekday = day_of_sim % 7
     is_weekend = weekday >= 5
 
+    # RESMI TATIL maskesi (madde 3): tatil gunlerinde baz yuk profili degisir
+    # (fabrika: uretim buyuk olcude durur; AVM: ziyaret yogunlugu artar).
+    is_holiday_day = holiday_mask(cfg)
+    is_holiday = is_holiday_day[day_of_sim]
+
     if is_factory:
         # Iki vardiyali fabrika: 08-12 ve 13-18 platolari + aksam vardiyasi omzu.
         # Aksam (17-21) baz yuk hala yuksektir; filo araclari tam bu saatlerde
-        # donup sarja girer -> BODOSLAMA'da baz+sarj trafoyu asar (overload).
+        # donup sarja girer -> algoritmasiz'da baz+sarj trafoyu asar (overload).
         shape = (
             0.30
             + 0.55 * np.exp(-((hour - 10.5) ** 2) / (2 * 2.2 ** 2))
@@ -247,6 +324,8 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
             + 0.45 * np.exp(-((hour - 19.5) ** 2) / (2 * 2.0 ** 2))  # aksam vardiyasi
         )
         weekend_mult = np.where(is_weekend, 0.45, 1.0)  # hafta sonu uretim az
+        # Resmi tatil: fabrikada uretim hafta sonundan da az (≈%40 baz seviye).
+        weekend_mult = np.where(is_holiday, 0.40, weekend_mult)
     else:
         # AVM: gunduz platosu + aksam tepe.
         shape = (
@@ -255,6 +334,8 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
             + 0.35 * np.exp(-((hour - 19.5) ** 2) / (2 * 1.8 ** 2))
         )
         weekend_mult = np.where(is_weekend, 1.08, 1.0)
+        # Resmi tatil: AVM ziyaret yogunlugu guclu hafta sonu gibi (≈+%12).
+        weekend_mult = np.where(is_holiday, 1.12, weekend_mult)
 
     shape = shape * weekend_mult
     # Sablonu [0,1]'e olcekle, sonra tepe = peak olacak sekilde carp.
@@ -336,6 +417,15 @@ def generate_market_prices(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray]:
         rng.beta(2.4, 1.3, size=days) * (pc.ptf_solar_max - pc.ptf_solar_min)
         + pc.ptf_solar_min, 0.0, 1.0,
     )
+    # AYLIK SOLAR FAKTORU (N4): gunduz ~0 penceresinin derinligi mevsime baglidir
+    # (kis aylarinda gunes zayif -> bastirma sig). Gun, GERCEK takvim ayina
+    # eslenir; boylece 12-aylik simulasyonlar gercek mevsimselligi tasir.
+    start = _sim_start_date(cfg)
+    msf = np.asarray(pc.monthly_solar_factor, dtype=np.float64)
+    month_factor = np.array(
+        [msf[(start + _dt.timedelta(days=int(d))).month - 1] for d in range(days)]
+    )
+    solar_depth = np.clip(solar_depth * month_factor, 0.0, 1.0)
 
     # ---- Saatlik matris (days x 24) ----
     ptf_hourly = (
@@ -408,7 +498,7 @@ def generate_sessions(cfg: SimConfig, fleet: pd.DataFrame) -> pd.DataFrame:
     if sc.is_factory:
         # LOJISTIK DEPO SURGE: tum filo vardiya sonunda (17:00-19:00) ESZAMANLI
         # doner ve fise takilir. 8 soket kuyrukla dolar; aksam baz yuku hala
-        # yuksekken (vardiya omzu) BODOSLAMA toplam yuku trafonun USTUNE cikarir
+        # yuksekken (vardiya omzu) algoritmasiz toplam yuku trafonun USTUNE cikarir
         # ve bu durum saatlerce surer -> gercek termal asiri yuklenme (overload).
         # Araclar ertesi sabah 05:00-07:00 cikar (gece bekleyebilir, delay cap yok).
         arr_min = np.clip(rng.normal(17.5 * 60, 0.5 * 60, size=m), 16 * 60 + 30, 19 * 60).astype(int)
