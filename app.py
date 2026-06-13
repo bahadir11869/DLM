@@ -143,6 +143,34 @@ def fmt_tl_usd(x_tl, rate):
     return f"{fmt_tl(x_tl)} ({fmt_usd(x_tl / max(rate, 1e-9))})"
 
 
+def fmt_num(x, decimals=0, sign=False):
+    """Sayiyi Turkce formatta dondurur: binlik ayiraci nokta, ondalik ayiraci virgul."""
+    if sign:
+        s = f"{float(x):+,.{decimals}f}"
+    else:
+        s = f"{float(x):,.{decimals}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _tr(fmt_str):
+    """Pandas style.format() icin Turkce sayi formatlayici (binlik=nokta, ondalik=virgul)."""
+    def _f(x):
+        try:
+            s = f"{float(x):{fmt_str}}"
+            return s.replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return str(x)
+    return _f
+
+
+def _tr_usd(x):
+    """USD degerini Turkce format ile gosterir ($1.234.567)."""
+    try:
+        return f"${float(x):,.0f}".replace(",", ".")
+    except Exception:
+        return str(x)
+
+
 def fig_autofmt(fig):
     """Tarih eksenli grafiklerde x-etiketlerini okunur acida dondurur."""
     try:
@@ -359,28 +387,28 @@ div_pct = diversified / rated * 100.0
 base_pct = P["base_peak_frac"] * 100.0
 naive_peak_pct = P["peak_naive"] / rated * 100.0
 gr = st.columns(4)
-gr[0].metric("Trafo Etkin Anma", f"{rated:.0f} kW", f"{P['transformer_kva']:.0f} kVA × {P['power_factor']:.2f}")
-gr[1].metric("Kurulu İstasyon", f"{installed:.0f} kW", f"cesitlilik {div:.2f}")
-gr[2].metric("Cesitlilikli Talep", f"{diversified:.0f} kW", f"%{div_pct:.0f} trafo (hedef %20-30)")
-gr[3].metric("Baz Yuk Tepe", f"{P['base_max_kw']:.0f} kW", f"%{base_pct:.0f} trafo (hedef %60)")
+gr[0].metric("Trafo Etkin Anma", f"{fmt_num(rated)} kW", f"{fmt_num(P['transformer_kva'])} kVA × {fmt_num(P['power_factor'], 2)}")
+gr[1].metric("Kurulu İstasyon", f"{fmt_num(installed)} kW", f"cesitlilik {fmt_num(div, 2)}")
+gr[2].metric("Cesitlilikli Talep", f"{fmt_num(diversified)} kW", f"%{fmt_num(div_pct)} trafo (hedef %20-30)")
+gr[3].metric("Baz Yuk Tepe", f"{fmt_num(P['base_max_kw'])} kW", f"%{fmt_num(base_pct)} trafo (hedef %60)")
 
 if naive_peak_pct <= 100.0:
     st.success(f"✅ **Overload YOK** (madde 9): algoritma ÖNCESI (algoritmasiz) tepe "
-        f"**{P['peak_naive']:.0f} kW** = trafo anmasinin **%{naive_peak_pct:.0f}**'i ≤ %100. "
-        f"Cesitlilik faktorlu istasyon talebi (%{div_pct:.0f}) + baz tepe (%{base_pct:.0f}) "
+        f"**{fmt_num(P['peak_naive'])} kW** = trafo anmasinin **%{fmt_num(naive_peak_pct)}**'i ≤ %100. "
+        f"Cesitlilik faktorlu istasyon talebi (%{fmt_num(div_pct)}) + baz tepe (%{fmt_num(base_pct)}) "
         f"trafoyu asmaz; DLM faydasi peak-shaving, maliyet, termal omur ve SOH'tur.")
 else:
-    st.warning(f"⚠️ Algoritma oncesi (algoritmasiz) tepe **{P['peak_naive']:.0f} kW** trafo "
-        f"anmasini (%{naive_peak_pct:.0f}) asiyor. Istasyon sayisini azaltin veya cesitlilik "
+    st.warning(f"⚠️ Algoritma oncesi (algoritmasiz) tepe **{fmt_num(P['peak_naive'])} kW** trafo "
+        f"anmasini (%{fmt_num(naive_peak_pct)}) asiyor. Istasyon sayisini azaltin veya cesitlilik "
         f"faktorunu dusurun (madde 9: algoritma oncesi bile overload olmamali).")
 if not (20.0 <= div_pct <= 30.0):
-    st.info(f"ℹ️ Cesitlilikli istasyon talebi trafo anmasinin **%{div_pct:.0f}**'i "
+    st.info(f"ℹ️ Cesitlilikli istasyon talebi trafo anmasinin **%{fmt_num(div_pct)}**'i "
         f"(hedef aralik %20-%30). Istasyon sayisini/cesitlilik faktorunu buna gore ayarlayin.")
 
 st.caption(
     f"⚖️ Aktif gerceklik ayarlari: guc bedeli rejimi **{P['billing_mode']}** "
     f"({'sozlesme bazli sabit; tasarruf = ceza farki + dusuk sozlesme firsati' if P['billing_mode'] == 'EPDK' else 'olculen tepe bazli'}) · "
-    f"tepe olcumu **15-dk ortalama** (EPDK/OSOS; naive {P['peak15_naive']:.0f} / opt {P['peak15_opt']:.0f} kW) · "
+    f"tepe olcumu **15-dk ortalama** (EPDK/OSOS; naive {fmt_num(P['peak15_naive'])} / opt {fmt_num(P['peak15_opt'])} kW) · "
     f"naive modeli **{'cesitlilik tavani' if P['naive_mode'] == 'diversity' else 'olay-tabanli (ust-sinir)'}** · "
     f"cikis belirsizligi **±{P['dep_unc']:.0f} dk** · "
     f"SOH kazanci operator ROI'sine **{'dahil (filo tesisin mali)' if P['is_factory'] else 'dahil DEGIL (musteri bataryasi — ayri kalem)'}**.")
@@ -389,22 +417,22 @@ top = st.columns(4)
 top[0].metric(f"Toplam Tasarruf ({P['cfg_days']} gun)", fmt_tl(A["total_saving_tl"]))
 top[1].metric("Yillik Projeksiyon", fmt_tl(A["annual_total_saving_tl"]))
 top[2].metric("Trafo Tepe (Once→Sonra)",
-              f"{P['peak_naive']:.0f}→{P['peak_opt']:.0f} kW")
+              f"{fmt_num(P['peak_naive'])}→{fmt_num(P['peak_opt'])} kW")
 top[3].metric("Filo / Oturum", f"{P['fleet_size']} / {P['n_sessions']}")
 
 # B1: Tamamlanma orani (algoritmanin araclari ac birakmadiginin kaniti) + ekstra KPI
 comp_opt = A["costs_opt"]["completion_rate"] * 100.0
 comp_naive = A["costs_naive"]["completion_rate"] * 100.0
 k = st.columns(4)
-k[0].metric("Tamamlanma — Algoritmali", f"%{comp_opt:.1f}",
-            f"{comp_opt - comp_naive:+.1f} puan vs algoritmasiz",
+k[0].metric("Tamamlanma — Algoritmali", f"%{fmt_num(comp_opt, 1)}",
+            f"{fmt_num(comp_opt - comp_naive, 1, sign=True)} puan vs algoritmasiz",
             help="%80 SoC'ye ulasan oturum orani. Algoritma araclari ac BIRAKMAMALIDIR; "
                  "bu KPI optimizasyonun tamamlanmayi feda etmedigini kanitlar.")
-k[1].metric("Tamamlanma — algoritmasiz", f"%{comp_naive:.1f}")
-k[2].metric("Sozlesme Gucu", f"{P['contracted_kw']:.0f} kW",
+k[1].metric("Tamamlanma — algoritmasiz", f"%{fmt_num(comp_naive, 1)}")
+k[2].metric("Sozlesme Gucu", f"{fmt_num(P['contracted_kw'])} kW",
             help="Guc asim cezasi bu esigin uzerinde baslar. Optimize tepe bu degere cekilir.")
-k[3].metric("Ort. Sarj Suresi (Algo)", f"{A['costs_opt']['avg_charge_duration_min']:.0f} dk",
-            f"algoritmasiz {A['costs_naive']['avg_charge_duration_min']:.0f} dk",
+k[3].metric("Ort. Sarj Suresi (Algo)", f"{fmt_num(A['costs_opt']['avg_charge_duration_min'])} dk",
+            f"algoritmasiz {fmt_num(A['costs_naive']['avg_charge_duration_min'])} dk",
             help="Ortalama tekil oturum sarj suresi. Madde 3 (guc tabani, S=3) ile "
                  "asiri uzamasi engellenir.")
 
@@ -456,10 +484,10 @@ with tabA:
                 hovertemplate="Sonrasi: %{y:.0f} kW<extra></extra>"))
         if show_rated:
             figp.add_hline(y=P["rated_kw"], line=dict(color="black", dash="dash", width=1.2),
-                annotation_text=f"Trafo Anma {P['rated_kw']:.0f} kW", annotation_position="top left")
+                annotation_text=f"Trafo Anma {fmt_num(P['rated_kw'])} kW", annotation_position="top left")
         if show_contract:
             figp.add_hline(y=P["contracted_kw"], line=dict(color="#ea8600", dash="dashdot", width=1.2),
-                annotation_text=f"Sozlesme {P['contracted_kw']:.0f} kW", annotation_position="bottom left")
+                annotation_text=f"Sozlesme {fmt_num(P['contracted_kw'])} kW", annotation_position="bottom left")
         if show_price:
             figp.add_trace(go.Scatter(x=x, y=price_d, name=plabel, yaxis="y2",
                 line=dict(color="#1a73e8", width=1.8, dash="dot"),
@@ -478,12 +506,12 @@ with tabA:
                            help="Grafikteki herhangi bir t anini bu imlecle de secip kesin kW/fiyat okuyabilirsiniz.")
         ti = int(round(t_hour * 60)) % MINUTES_PER_DAY
         rc = st.columns(4)
-        rc[0].metric("Baz Yuk @t", f"{base[ti]:.0f} kW")
-        rc[1].metric("Oncesi (algoritmasiz) @t", f"{fac_naive[ti]:.0f} kW")
-        rc[2].metric("Sonrasi (optimize) @t", f"{fac_opt[ti]:.0f} kW",
-                     f"{fac_opt[ti]-fac_naive[ti]:+.0f} kW")
+        rc[0].metric("Baz Yuk @t", f"{fmt_num(base[ti])} kW")
+        rc[1].metric("Oncesi (algoritmasiz) @t", f"{fmt_num(fac_naive[ti])} kW")
+        rc[2].metric("Sonrasi (optimize) @t", f"{fmt_num(fac_opt[ti])} kW",
+                     f"{fmt_num(fac_opt[ti]-fac_naive[ti], sign=True)} kW")
         rc[3].metric(f"Fiyat @t ({'PTF' if P['pricing_mode']=='PTF' else 'Tarife'})",
-                     f"{price_d[ti]:.3f} TL/kWh")
+                     f"{fmt_num(price_d[ti], 3)} TL/kWh")
 
     with st.expander("⚡ Sarj Egrisi · Algoritma Oncesi vs Sonrasi (madde 8)", expanded=True):
         st.caption("Yalnizca SARJ gucu (baz yuk haric). Algoritma oncesi (algoritmasiz) "
@@ -521,9 +549,9 @@ with tabA:
             }).sort_values("Sure — Sonrasi (dk)", ascending=False)
             dcol = st.columns(3)
             dcol[0].metric("Bu gun oturum", f"{len(day_tbl)}")
-            dcol[1].metric("Ort. sure — Oncesi", f"{np.nanmean(day_tbl['charge_duration_min_naive']):.0f} dk")
-            dcol[2].metric("Ort. sure — Sonrasi", f"{np.nanmean(day_tbl['charge_duration_min_opt']):.0f} dk",
-                           f"{np.nanmean(day_tbl['Uzama (dk)']):+.0f} dk ort. uzama")
+            dcol[1].metric("Ort. sure — Oncesi", f"{fmt_num(np.nanmean(day_tbl['charge_duration_min_naive']))} dk")
+            dcol[2].metric("Ort. sure — Sonrasi", f"{fmt_num(np.nanmean(day_tbl['charge_duration_min_opt']))} dk",
+                           f"{fmt_num(np.nanmean(day_tbl['Uzama (dk)']), sign=True)} dk ort. uzama")
             st.dataframe(show.style.format({
                 "Sure — Oncesi (dk)": "{:.0f}", "Sure — Sonrasi (dk)": "{:.0f}",
                 "Uzama (dk)": "{:+.0f}",
@@ -538,15 +566,15 @@ with tabA:
     cc[0].metric("Maliyet — Algoritma Oncesi", fmt_tl(cost_naive))
     cc[1].metric("Maliyet — Algoritma Sonrasi", fmt_tl(cost_opt))
     cc[2].metric("Tasarruf (TL)", fmt_tl(saving))
-    cc[3].metric("Tasarruf (%)", f"%{saving_pct:.1f}")
+    cc[3].metric("Tasarruf (%)", f"%{fmt_num(saving_pct, 1)}")
 
     shave, pct, extra, ev_inc = day_roi(P, float(fac_opt.max()), float(fac_naive.max()))
     st.markdown("#### 🏭 Rezerv Yuk (Power Shaving) Yatirim Getirisi")
     st.success(
-        f"Trafo tepe yukunde **%{pct:.0f}** ({shave:.0f} kW) tirasama yapildi; ayni trafoda "
-        f"**{shave:.0f} kW** buyume payi (headroom) olustu. Yeni talebin de DLM tavani "
+        f"Trafo tepe yukunde **%{fmt_num(pct)}** ({fmt_num(shave)} kW) tirasama yapildi; ayni trafoda "
+        f"**{fmt_num(shave)} kW** buyume payi (headroom) olustu. Yeni talebin de DLM tavani "
         f"altinda yonetilmesi KOSULUYLA ilave **{extra} adet** DC istasyona alan acilir; "
-        f"desteklenen EV kapasitesi **%{ev_inc:.0f}** artirilabilir. Trafo-tarafi parasal "
+        f"desteklenen EV kapasitesi **%{fmt_num(ev_inc)}** artirilabilir. Trafo-tarafi parasal "
         f"kazanc, asim cezalarinin onlenmesi ve sozlesme gucunun dusuk tutulabilmesidir "
         f"(bu boyutlandirmada termal omur kazanci kucuktur — bkz. Bolum B termal panel).")
 
@@ -565,29 +593,29 @@ with tabA:
         hc = st.columns(2)
         with hc[0]:
             st.markdown("**🔴 Algoritma Oncesi (algoritmasiz)**")
-            st.metric("Tepe Yuk", f"{peak_n_day:.0f} kW", f"%{peak_n_day/rated*100:.0f} trafo doluluk")
-            st.metric("Bosta Trafo Gucu (tepe ani)", f"{idle_n:.0f} kW",
-                      f"gun ort. {idle_n_mean:.0f} kW", delta_color="off")
-            st.metric("↳ Trafo kurulu gucune oran", f"%{idle_n/rated*100:.0f}",
+            st.metric("Tepe Yuk", f"{fmt_num(peak_n_day)} kW", f"%{fmt_num(peak_n_day/rated*100)} trafo doluluk")
+            st.metric("Bosta Trafo Gucu (tepe ani)", f"{fmt_num(idle_n)} kW",
+                      f"gun ort. {fmt_num(idle_n_mean)} kW", delta_color="off")
+            st.metric("↳ Trafo kurulu gucune oran", f"%{fmt_num(idle_n/rated*100)}",
                       help="Bosta guc / trafo etkin anma (1520 kW).")
-            st.metric("↳ Sozlesme gucune oran", f"%{idle_n/contract*100:.0f}",
-                      help=f"Bosta guc / sozlesme gucu ({contract:.0f} kW).")
+            st.metric("↳ Sozlesme gucune oran", f"%{fmt_num(idle_n/contract*100)}",
+                      help=f"Bosta guc / sozlesme gucu ({fmt_num(contract)} kW).")
         with hc[1]:
             st.markdown("**🟢 Algoritma Sonrasi (optimize)**")
-            st.metric("Tepe Yuk", f"{peak_o_day:.0f} kW", f"{peak_o_day-peak_n_day:+.0f} kW vs oncesi")
-            st.metric("Bosta Trafo Gucu (tepe ani)", f"{idle_o:.0f} kW",
-                      f"{idle_o-idle_n:+.0f} kW vs oncesi")
-            st.metric("↳ Trafo kurulu gucune oran", f"%{idle_o/rated*100:.0f}",
-                      f"{(idle_o-idle_n)/rated*100:+.0f} puan")
-            st.metric("↳ Sozlesme gucune oran", f"%{idle_o/contract*100:.0f}",
-                      f"{(idle_o-idle_n)/contract*100:+.0f} puan")
+            st.metric("Tepe Yuk", f"{fmt_num(peak_o_day)} kW", f"{fmt_num(peak_o_day-peak_n_day, sign=True)} kW vs oncesi")
+            st.metric("Bosta Trafo Gucu (tepe ani)", f"{fmt_num(idle_o)} kW",
+                      f"{fmt_num(idle_o-idle_n, sign=True)} kW vs oncesi")
+            st.metric("↳ Trafo kurulu gucune oran", f"%{fmt_num(idle_o/rated*100)}",
+                      f"{fmt_num((idle_o-idle_n)/rated*100, sign=True)} puan")
+            st.metric("↳ Sozlesme gucune oran", f"%{fmt_num(idle_o/contract*100)}",
+                      f"{fmt_num((idle_o-idle_n)/contract*100, sign=True)} puan")
         st.info(
-            f"💡 **Finansal anlam:** Tepe aninda trafonun **%{idle_o/rated*100:.0f}**'i (≈{idle_o:.0f} kW) "
-            f"bostadir. Algoritma tepeyi tirasayarak bosta gucu **{idle_n:.0f}→{idle_o:.0f} kW** "
-            f"(+{idle_o-idle_n:.0f} kW) buyuttu. Bu rezerv ya **ilave EV/istasyon geliri**ne donusturulur, "
+            f"💡 **Finansal anlam:** Tepe aninda trafonun **%{fmt_num(idle_o/rated*100)}**'i (≈{fmt_num(idle_o)} kW) "
+            f"bostadir. Algoritma tepeyi tirasayarak bosta gucu **{fmt_num(idle_n)}→{fmt_num(idle_o)} kW** "
+            f"(+{fmt_num(idle_o-idle_n)} kW) buyuttu. Bu rezerv ya **ilave EV/istasyon geliri**ne donusturulur, "
             f"ya da **daha dusuk sozlesme gucu** secilerek aylik guc bedeli dusurulur (asagidaki duyarlilik). "
-            f"Sozlesme gucune gore bosta pay {idle_n/contract*100:.0f}%→{idle_o/contract*100:.0f}%; "
-            f"yani sozlesme esigi ile tepe arasinda {contract-peak_o_day:+.0f} kW guvenli marj kalir "
+            f"Sozlesme gucune gore bosta pay %{fmt_num(idle_n/contract*100)}→%{fmt_num(idle_o/contract*100)}; "
+            f"yani sozlesme esigi ile tepe arasinda {fmt_num(contract-peak_o_day, sign=True)} kW guvenli marj kalir "
             f"({'asim/ceza yok' if peak_o_day <= contract else 'tepe sozlesmeyi asiyor — ceza riski'}).")
 
         st.caption("ℹ️ Sozlesme gucu artirmanin maliyeti ve uzun-vadeli finansal karsiliklar "
@@ -610,10 +638,10 @@ with tabB:
 
     lp = A["life_proj"]; pj_o = lp["proj_opt"]; pj_n = lp["proj_naive"]
     with st.expander("🔥 Trafo Omru (30 Yil Bazli) - IEC 60076-7 · Oncesi vs Sonrasi (madde 2)", expanded=True):
-        st.caption(f"Trafo NORMAL/TASARIM omru **{design_life:.0f} yil** alinir (referans yaslanma "
+        st.caption(f"Trafo NORMAL/TASARIM omru **{fmt_num(design_life)} yil** alinir (referans yaslanma "
                    f"hizinda, sicak-nokta 98°C). Sicak-nokta IEC 60076-7:2018 fark-denklemi + GERCEK "
-                   f"Ankara ortam sicakligiyla (tepe ~{A['ambient_peak_c']:.0f}°C) hesaplanir; bagil "
-                   f"yaslanma V=2^((θh−98)/6). Asagida, ÖNCE/SONRA omur tuketimi {design_life:.0f} yila "
+                   f"Ankara ortam sicakligiyla (tepe ~{fmt_num(A['ambient_peak_c'])}°C) hesaplanir; bagil "
+                   f"yaslanma V=2^((θh−98)/6). Asagida, ÖNCE/SONRA omur tuketimi {fmt_num(design_life)} yila "
                    f"oranla yuzdesel verilir ve fark trafo maliyetiyle parasallastirilir.")
         # Bu DONEMDE (sim penceresi) tuketilen omur, 30 yillik butceye (262.800 saat) oranla %
         pct_period_n = th_n["pct_life_consumed"]      # = lol_hours / (30y*8760) * 100
@@ -625,28 +653,28 @@ with tabB:
 
         k1, k2, k3 = st.columns(3)
         k1.metric("Tepe Sicak-Nokta (Once→Sonra)",
-                  f"{th_n['theta_hs_peak']:.0f}→{th_o['theta_hs_peak']:.0f} °C",
+                  f"{fmt_num(th_n['theta_hs_peak'])}→{fmt_num(th_o['theta_hs_peak'])} °C",
                   help="98°C altinda yaslanma referanstan (normalden) yavastir.")
         k2.metric(f"Bu Donemde ({period_lbl}) Tuketilen Omur",
-                  f"%{pct_period_n:.3f}→%{pct_period_o:.3f}",
-                  f"{(pct_period_o-pct_period_n):+.3f} puan",
-                  help=f"Bu simulasyon doneminde tuketilen omur, {design_life:.0f} yillik toplam "
+                  f"%{fmt_num(pct_period_n, 3)}→%{fmt_num(pct_period_o, 3)}",
+                  f"{fmt_num(pct_period_o-pct_period_n, 3, sign=True)} puan",
+                  help=f"Bu simulasyon doneminde tuketilen omur, {fmt_num(design_life)} yillik toplam "
                        f"omre oranla. (Δ × trafo maliyeti = donem trafo tasarrufu.)")
         k3.metric("30 Yilda Tuketilen Omur (projeksiyon)",
-                  f"%{pct_30y_n:.2f}→%{pct_30y_o:.2f}",
-                  help=f"Bu yuk profili 30 yil surerse (mevsim faktoru {lp['seasonal_factor']:.2f}) "
+                  f"%{fmt_num(pct_30y_n, 2)}→%{fmt_num(pct_30y_o, 2)}",
+                  help=f"Bu yuk profili 30 yil surerse (mevsim faktoru {fmt_num(lp['seasonal_factor'], 2)}) "
                        f"tuketilecek omur yuzdesi. %100 = 30 yil sonunda omur biter.")
 
         st.success(
             f"💰 **Algoritmanin trafo omrune kazanci (madde 2):** Bu donemde "
-            f"({period_lbl}) omur tuketimi **%{pct_period_n:.3f} → %{pct_period_o:.3f}** "
-            f"({(pct_period_n-pct_period_o):+.3f} puan dusus). Bu farkin {design_life:.0f} yillik "
+            f"({period_lbl}) omur tuketimi **%{fmt_num(pct_period_n, 3)} → %{fmt_num(pct_period_o, 3)}** "
+            f"({fmt_num(pct_period_n-pct_period_o, 3, sign=True)} puan dusus). Bu farkin {fmt_num(design_life)} yillik "
             f"omur butcesine ({fmt_tl_usd(tcost_tl, usd_rate)} trafo) parasal karsiligi: "
             f"**{fmt_tl_usd(save_period_tl, usd_rate)}** (bu donem). Yillik projeksiyon: "
             f"**{fmt_tl_usd(save_period_tl*annual_factor_b, usd_rate)}/yil**; "
             f"30 yil profili surdugunde korunan omur: **{fmt_tl_usd(save_30y_tl, usd_rate)}**.")
         st.caption(f"Trafo yenileme maliyeti: **{fmt_tl_usd(tcost_tl, usd_rate)}** "
-                   f"(USD/TRY={usd_rate:.1f}). Not: Dogru boyutlandirilmis (overload'suz) bu sistemde "
+                   f"(USD/TRY={fmt_num(usd_rate, 1)}). Not: Dogru boyutlandirilmis (overload'suz) bu sistemde "
                    f"termal yaslanma dusuktur; trafo omru cogunlukla 30 yillik FIZIKSEL tasarim omruyle "
                    f"sinirlidir. Asil buyuk trafo-tarafi kazanc, asim/overload CEZALARININ onlenmesidir "
                    f"(asagidaki bolumler).")
@@ -660,14 +688,14 @@ with tabB:
         axt.plot(date_axis, cum_o_pct, color="#1e8e3e", lw=2, label="Algoritmali")
         axt.fill_between(date_axis, cum_o_pct, cum_n_pct, color="#fbbc04", alpha=0.25,
                          label="Onlenen Omur Tuketimi")
-        axt.set_xlabel("Tarih"); axt.set_ylabel(f"Tuketilen Omur (%/{design_life:.0f} yil)")
+        axt.set_xlabel("Tarih"); axt.set_ylabel(f"Tuketilen Omur (%/{fmt_num(design_life)} yil)")
         axt.grid(alpha=0.25); axt.legend(fontsize=9); fig_autofmt(figt)
         figt.tight_layout(); st.pyplot(figt); plt.close(figt)
 
     with st.expander("🔋 Batarya Sagligi (SOH) Kumulatif Analizi", expanded=True):
         s1, s2, s3 = st.columns(3)
-        s1.metric("Ort. SOH Dususu — Algoritmasiz", f"%{soh['final_soh_drop_naive_pct']:.3f}")
-        s2.metric("Ort. SOH Dususu — Algoritmali", f"%{soh['final_soh_drop_opt_pct']:.3f}")
+        s1.metric("Ort. SOH Dususu — Algoritmasiz", f"%{fmt_num(soh['final_soh_drop_naive_pct'], 3)}")
+        s2.metric("Ort. SOH Dususu — Algoritmali", f"%{fmt_num(soh['final_soh_drop_opt_pct'], 3)}")
         s3.metric("Geciktirilen Batarya Degisim Bedeli", fmt_tl(soh["delayed_replacement_value_tl"]))
         figs, axs = plt.subplots(figsize=(12, 3.8))
         axs.plot(date_axis, soh["soh_naive_ts"], color="#d93025", lw=2, label="Algoritmasiz")
@@ -685,12 +713,12 @@ with tabB:
                    "yaniltici biçimde sisiyordu).")
         st.dataframe(
             soh["table"].style.format({
-                "SOH Dususu Algoritmali (%)": "{:.4f}", "SOH Dususu Algoritmasiz (%)": "{:.4f}",
-                "SOH Korunan (puan)": "{:.4f}",
-                "Toplam Sarj Suresi Algoritmali (dk)": "{:,.0f}",
-                "Toplam Sarj Suresi Algoritmasiz (dk)": "{:,.0f}",
-                "Maks Sarj Uzatma (dk)": "{:.0f}", "Toplam Sure Uzamasi (%)": "{:.1f}",
-                "Korunan Batarya Bedeli (TL)": "{:,.0f}",
+                "SOH Dususu Algoritmali (%)": _tr(".4f"), "SOH Dususu Algoritmasiz (%)": _tr(".4f"),
+                "SOH Korunan (puan)": _tr(".4f"),
+                "Toplam Sarj Suresi Algoritmali (dk)": _tr(",.0f"),
+                "Toplam Sarj Suresi Algoritmasiz (dk)": _tr(",.0f"),
+                "Maks Sarj Uzatma (dk)": _tr(".0f"), "Toplam Sure Uzamasi (%)": _tr(".1f"),
+                "Korunan Batarya Bedeli (TL)": _tr(",.0f"),
             }), use_container_width=True, hide_index=True, height=430)
 
     # ---- Senaryo: Baz Yuk Artisi +%10/+%15/+%20 (her calistirmada otomatik) ----
@@ -714,7 +742,7 @@ with tabB:
                     "15-dk Tepe Sonrasi (kW)": R["peak15_opt"],
                     "Asim Cezasi Oncesi (TL)": R["demand_penalty_naive"],
                     "Asim Cezasi Sonrasi (TL)": R["demand_penalty_opt"],
-                    "θhs Tepe Once→Sonra (°C)": f"{tn_r['theta_hs_peak']:.0f}→{to_r['theta_hs_peak']:.0f}",
+                    "θhs Tepe Once→Sonra (°C)": f"{fmt_num(tn_r['theta_hs_peak'])}→{fmt_num(to_r['theta_hs_peak'])}",
                     "Omur Tuketimi Oncesi (%)": tn_r["pct_life_consumed"],
                     "Omur Tuketimi Sonrasi (%)": to_r["pct_life_consumed"],
                     "Termal Tasarruf (TL)": AR["thermal_saving_tl"],
@@ -722,11 +750,11 @@ with tabB:
                 })
             df_b = pd.DataFrame(rows_b)
             st.dataframe(df_b.style.format({
-                "Baz Tepe (kW)": "{:.0f}",
-                "15-dk Tepe Oncesi (kW)": "{:.0f}", "15-dk Tepe Sonrasi (kW)": "{:.0f}",
-                "Asim Cezasi Oncesi (TL)": "{:,.0f}", "Asim Cezasi Sonrasi (TL)": "{:,.0f}",
-                "Omur Tuketimi Oncesi (%)": "{:.4f}", "Omur Tuketimi Sonrasi (%)": "{:.4f}",
-                "Termal Tasarruf (TL)": "{:,.0f}", "Toplam Tasarruf (TL)": "{:,.0f}",
+                "Baz Tepe (kW)": _tr(".0f"),
+                "15-dk Tepe Oncesi (kW)": _tr(".0f"), "15-dk Tepe Sonrasi (kW)": _tr(".0f"),
+                "Asim Cezasi Oncesi (TL)": _tr(",.0f"), "Asim Cezasi Sonrasi (TL)": _tr(",.0f"),
+                "Omur Tuketimi Oncesi (%)": _tr(".4f"), "Omur Tuketimi Sonrasi (%)": _tr(".4f"),
+                "Termal Tasarruf (TL)": _tr(",.0f"), "Toplam Tasarruf (TL)": _tr(",.0f"),
             }), use_container_width=True, hide_index=True)
 
             P20 = st.session_state["PBASE"][max(st.session_state["PBASE"])]
@@ -735,14 +763,14 @@ with tabB:
             th_gain_20 = A20["thermal_saving_tl"]
             pen_gain_20 = P20["demand_penalty_naive"] - P20["demand_penalty_opt"]
             st.error(
-                f"Baz yuk +%20 oldugunda **algoritmasiz** 15-dk tepe {P20['peak15_naive']:.0f} kW'a "
+                f"Baz yuk +%20 oldugunda **algoritmasiz** 15-dk tepe {fmt_num(P20['peak15_naive'])} kW'a "
                 f"cikar; asim cezasi **{fmt_tl(P20['demand_penalty_naive'])}** olur. **Algoritma** "
-                f"tepeyi {P20['peak15_opt']:.0f} kW'a cekerek cezayi "
+                f"tepeyi {fmt_num(P20['peak15_opt'])} kW'a cekerek cezayi "
                 f"**{fmt_tl(P20['demand_penalty_opt'])}**'ye indirir (onlenen: {fmt_tl(pen_gain_20)}).")
             st.success(
                 f"🔥 **Termal kazanc baz yukle birlikte buyur:** donem termal tasarrufu "
                 f"mevcutta {fmt_tl(th_gain_now)} iken +%20 baz yukte "
-                f"**{fmt_tl(th_gain_20)}**'ye cikar (×{th_gain_20/max(th_gain_now,1e-9):.1f}). "
+                f"**{fmt_tl(th_gain_20)}**'ye cikar (×{fmt_num(th_gain_20/max(th_gain_now,1e-9), 1)}). "
                 f"Sicak-nokta yukseldikce yaslanma ustel hizlandigi icin, trafo dolulugu "
                 f"arttikca DLM'in trafo-omru getirisi de buyur — tesis buyudukce algoritmanin "
                 f"degeri artar.")
@@ -810,7 +838,7 @@ with tabB:
                          f"+{growth} arac vs oncesi",
                          help="Optimize tepe sozlesmeye kirpildigi icin ceza HIC olusmaz; sinir, "
                               "tamamlanma oraninin %98 altina dusmesidir (soket sayisi belirleyici olabilir).")
-            fc[2].metric("Filo Buyume Kapasitesi", f"%{growth_pct:.0f}",
+            fc[2].metric("Filo Buyume Kapasitesi", f"%{fmt_num(growth_pct)}",
                          help="Ayni trafo, ayni soketler, ayni sozlesme gucuyle desteklenebilen ek filo.")
             if n_opt >= 300:
                 st.info("ℹ️ Algoritma sonrasi limit arama tavanina (300) dayandi; gercek sinir soket "
@@ -819,7 +847,7 @@ with tabB:
                 f"💼 **Yatirimci mesaji:** Ayni trafo ve sozlesme gucuyle, algoritmasiz isletme "
                 f"**{n_naive} araclik** filoda ceza sinirina dayanir. DLM ile filo, ceza riski "
                 f"OLMADAN ve %98+ tamamlanma korunarak **{n_opt} araca** buyutulebilir — "
-                f"**+{growth} arac (%{growth_pct:.0f} buyume)**, ilave trafo/sozlesme yatirimi "
+                f"**+{growth} arac (%{fmt_num(growth_pct)} buyume)**, ilave trafo/sozlesme yatirimi "
                 f"gerektirmeden.")
 
     # ---- SOZLESME GUCU ARTIRMA MALIYETI (madde 4, 5) ----
@@ -845,36 +873,36 @@ with tabB:
                 "Yillik Guc Bedeli (TL)": newC * dc_b * 12.0,
                 "Ek Maliyet/yil (TL)": extra,
                 "Ek Maliyet/yil (USD)": extra / usd_rate,
-                "Toplam Faturaya Etki": f"%{extra/total_y_ob*100:.1f}",
+                "Toplam Faturaya Etki": f"%{fmt_num(extra/total_y_ob*100, 1)}",
             })
         st.dataframe(pd.DataFrame(rows).style.format({
-            "Yeni Sozlesme (kW)": "{:.0f}", "Yillik Guc Bedeli (TL)": "{:,.0f}",
-            "Ek Maliyet/yil (TL)": "{:,.0f}", "Ek Maliyet/yil (USD)": "${:,.0f}",
+            "Yeni Sozlesme (kW)": _tr(".0f"), "Yillik Guc Bedeli (TL)": _tr(",.0f"),
+            "Ek Maliyet/yil (TL)": _tr(",.0f"), "Ek Maliyet/yil (USD)": _tr_usd,
         }), use_container_width=True, hide_index=True)
         st.warning(
-            f"📈 Ornek: Sozlesme gucunu **%20** artirmak ({contract_b:.0f}→{contract_b*1.2:.0f} kW), "
+            f"📈 Ornek: Sozlesme gucunu **%20** artirmak ({fmt_num(contract_b)}→{fmt_num(contract_b*1.2)} kW), "
             f"yillik guc bedelini **{fmt_tl_usd(0.2*contract_b*dc_b*12, usd_rate)}** = toplam faturanin "
-            f"**%{0.2*contract_b*dc_b*12/total_y_ob*100:.1f}**'i kadar artirir (enerji maliyeti degismez).")
+            f"**%{fmt_num(0.2*contract_b*dc_b*12/total_y_ob*100, 1)}**'i kadar artirir (enerji maliyeti degismez).")
         red_kw = max(0.0, peak_nb - peak_ob)
         red_pct = (red_kw / peak_nb * 100.0) if peak_nb > 0 else 0.0
         save_y_contract = red_kw * dc_b * 12.0
         st.success(
-            f"✅ **Algoritmanin getirisi (ters yon):** Tepe yuk {peak_nb:.0f}→{peak_ob:.0f} kW "
-            f"(−%{red_pct:.0f}) dustugu icin, ayni operasyonu **{red_kw:.0f} kW daha dusuk** sozlesme "
+            f"✅ **Algoritmanin getirisi (ters yon):** Tepe yuk {fmt_num(peak_nb)}→{fmt_num(peak_ob)} kW "
+            f"(−%{fmt_num(red_pct)}) dustugu icin, ayni operasyonu **{fmt_num(red_kw)} kW daha dusuk** sozlesme "
             f"gucuyle (asim cezasiz) yurutebilirsiniz → yillik **{fmt_tl_usd(save_y_contract, usd_rate)}** "
             f"guc bedeli tasarrufu. DLM, sozlesme gucu artirmaya gerek BIRAKMADAN buyumeyi mumkun kilar.")
 
     # ---- UZUN VADELI FINANSAL OZET (madde 5): tum kalemler tek tabloda ----
     with st.expander("💼 Uzun Vadeli Finansal Ozet — Tum Kazanim/Maliyet Kalemleri (madde 5)", expanded=True):
         st.caption(f"Finansal karsiligi olan tum uzun-vadeli kalemler. Donem = {period_lbl}. "
-                   f"Yillik projeksiyon MEVSIM DUZELTMELIDIR (N4): enerji ×{annual_factor_b:.2f}"
-                   f"×{A['energy_seasonal_factor']:.2f} (solar makasi kisin sig), termal "
-                   f"×{annual_factor_b:.2f}×{A['life_proj']['seasonal_factor']:.2f} (kis ortami serin); "
+                   f"Yillik projeksiyon MEVSIM DUZELTMELIDIR (N4): enerji ×{fmt_num(annual_factor_b, 2)}"
+                   f"×{fmt_num(A['energy_seasonal_factor'], 2)} (solar makasi kisin sig), termal "
+                   f"×{fmt_num(annual_factor_b, 2)}×{fmt_num(A['life_proj']['seasonal_factor'], 2)} (kis ortami serin); "
                    f"demand/SOH lineer. Guc bedeli rejimi: **{P['billing_mode']}**.")
         items = [
             ("Toplam Enerji Tasarrufu", A["energy_saving_tl"], A["annual_energy_saving_tl"],
              f"Ucuz saatlere kaydirma (PTF/tarife) ile dogrudan OPEX dususu. "
-             f"Yillik = ×{annual_factor_b:.2f}×{A['energy_seasonal_factor']:.2f} mevsim duzeltmesi."),
+             f"Yillik = ×{fmt_num(annual_factor_b, 2)}×{fmt_num(A['energy_seasonal_factor'], 2)} mevsim duzeltmesi."),
             ("Demand/Asim Tasarrufu", A["demand_saving_tl"], A["annual_demand_saving_tl"],
              ("EPDK rejimi: guc bedeli sozlesme bazli SABIT -> tasarruf yalnizca ASIM CEZASI "
               "farkidir (15-dk tepe olcumu)." if P["billing_mode"] == "EPDK"
@@ -884,7 +912,7 @@ with tabB:
              (P["demand_penalty_naive"] - P["demand_penalty_opt"]) * annual_factor_b,
              "Sozlesme asimi cezasi (EPDK ×3, 15-dk ortalama tepe); ustteki kalemin alt-detayi."),
             ("Trafo Omru Kazanci (30y bazli)", A["thermal_saving_tl"], A["annual_thermal_saving_tl"],
-             f"(Δ omur tuketimi %) × trafo maliyeti ({design_life:.0f} yil bazli). Dogru "
+             f"(Δ omur tuketimi %) × trafo maliyeti ({fmt_num(design_life)} yil bazli). Dogru "
              f"boyutlandirilmis sistemde KUCUKTUR; asil trafo-tarafi kazanc asim/sozlesme tarafidir."),
         ]
         if A["soh_in_operator_roi"]:
@@ -900,7 +928,7 @@ with tabB:
             "Aciklama": desc,
         } for (nm, dv, yv, desc) in items])
         st.dataframe(df_long.style.format({
-            f"Donem ({period_lbl}) TL": "{:,.0f}", "Yillik TL": "{:,.0f}", "Yillik USD": "${:,.0f}",
+            f"Donem ({period_lbl}) TL": _tr(",.0f"), "Yillik TL": _tr(",.0f"), "Yillik USD": _tr_usd,
         }), use_container_width=True, hide_index=True)
         if not A["soh_in_operator_roi"]:
             st.info(f"🔋 **SOH kazanci ({fmt_tl(A['soh_saving_tl'])}/donem) operator ROI'sine "
@@ -922,7 +950,7 @@ with tabB:
     f[0].metric("Enerji Tasarrufu", fmt_tl(A["energy_saving_tl"]))
     f[1].metric("Demand Charge Tasarrufu", fmt_tl(A["demand_saving_tl"]))
     f[2].metric("Trafo Omru Kazanci", fmt_tl(A["thermal_saving_tl"]),
-                help=f"(Δ omur tuketimi %) × trafo maliyeti, {design_life:.0f} yil bazli (madde 2). "
+                help=f"(Δ omur tuketimi %) × trafo maliyeti, {fmt_num(design_life)} yil bazli (madde 2). "
                      f"USD: {fmt_usd(A['thermal_saving_tl']/usd_rate)}.")
     f[3].metric("SOH (Batarya) Tasarrufu", fmt_tl(A["soh_saving_tl"]),
                 help="GOSTERGE niteligindedir (k=0.6 kalibre edilmemis). AVM senaryosunda "
@@ -936,11 +964,11 @@ with tabB:
         cn = A["costs_naive"]; co = A["costs_opt"]
         idle_pk_n = rated - P["peak_naive"]; idle_pk_o = rated - P["peak_opt"]
         rows_fin = [
-            ("Trafo Tepe Yuku (kW)", f"{P['peak_naive']:.0f}", f"{P['peak_opt']:.0f}",
+            ("Trafo Tepe Yuku (kW)", fmt_num(P['peak_naive']), fmt_num(P['peak_opt']),
              "Tepe ne kadar dusukse demand charge + asim cezasi o kadar az; sozlesme gucu dusurulebilir."),
-            ("Bosta Trafo Gucu @tepe (kW)", f"{idle_pk_n:.0f}", f"{idle_pk_o:.0f}",
-             f"Anma−tepe. Buyuyen bosluk (+{idle_pk_o-idle_pk_n:.0f} kW) = ertelenen trafo yatirimi + ilave EV geliri firsati."),
-            ("Trafo Doluluk (%)", f"%{P['peak_naive']/rated*100:.0f}", f"%{P['peak_opt']/rated*100:.0f}",
+            ("Bosta Trafo Gucu @tepe (kW)", fmt_num(idle_pk_n), fmt_num(idle_pk_o),
+             f"Anma−tepe. Buyuyen bosluk (+{fmt_num(idle_pk_o-idle_pk_n)} kW) = ertelenen trafo yatirimi + ilave EV geliri firsati."),
+            ("Trafo Doluluk (%)", f"%{fmt_num(P['peak_naive']/rated*100)}", f"%{fmt_num(P['peak_opt']/rated*100)}",
              "Doluluk dustukce overload/termal risk ve buyume kisiti azalir."),
             ("Enerji Maliyeti (yil, TL)", fmt_tl(cn['energy_cost_tl']*annual_factor_b),
              fmt_tl(co['energy_cost_tl']*annual_factor_b),
@@ -953,16 +981,16 @@ with tabB:
             ("Guc Asim Cezasi (yil, TL)", fmt_tl(cn['demand_penalty_tl']*annual_factor_b),
              fmt_tl(co['demand_penalty_tl']*annual_factor_b),
              "Sozlesme asiminin cezasi (EPDK ×3, 15-dk ortalama tepe). Algoritma tepeyi esige cekerek sifira yaklastirir."),
-            ("Tepe Sicak-Nokta (°C)", f"{th_n['theta_hs_peak']:.0f}", f"{th_o['theta_hs_peak']:.0f}",
+            ("Tepe Sicak-Nokta (°C)", fmt_num(th_n['theta_hs_peak']), fmt_num(th_o['theta_hs_peak']),
              "Dusuk sicaklik = ustel olarak yavas yaslanma = ertelenen trafo degisimi."),
-            ("30 Yilda Tuketilen Omur (%)", f"%{pj_n['pct_life_horizon']:.2f}", f"%{pj_o['pct_life_horizon']:.2f}",
+            ("30 Yilda Tuketilen Omur (%)", f"%{fmt_num(pj_n['pct_life_horizon'], 2)}", f"%{fmt_num(pj_o['pct_life_horizon'], 2)}",
              f"Korunan omur kesri × trafo bedeli = {fmt_tl(A['thermal_saving_tl'])} ertelenen degisim."),
-            ("Ort. SOH Dususu (%)", f"%{soh['final_soh_drop_naive_pct']:.3f}", f"%{soh['final_soh_drop_opt_pct']:.3f}",
+            ("Ort. SOH Dususu (%)", f"%{fmt_num(soh['final_soh_drop_naive_pct'], 3)}", f"%{fmt_num(soh['final_soh_drop_opt_pct'], 3)}",
              f"Korunan batarya sagligi = {fmt_tl(A['soh_saving_tl'])} geciktirilen batarya degisimi "
              f"({'operator ROI dahil' if A['soh_in_operator_roi'] else 'musteri faydasi, ROI haric'}; gosterge)."),
-            ("Ort. Sarj Suresi (dk)", f"{cn['avg_charge_duration_min']:.0f}", f"{co['avg_charge_duration_min']:.0f}",
+            ("Ort. Sarj Suresi (dk)", fmt_num(cn['avg_charge_duration_min']), fmt_num(co['avg_charge_duration_min']),
              "Algoritma sureyi uzatabilir (esneklik), ama tamamlanma korunur (S=3 taban ile sinirli)."),
-            ("Tamamlanma Orani (%)", f"%{cn['completion_rate']*100:.1f}", f"%{co['completion_rate']*100:.1f}",
+            ("Tamamlanma Orani (%)", f"%{fmt_num(cn['completion_rate']*100, 1)}", f"%{fmt_num(co['completion_rate']*100, 1)}",
              "Araclar %80'e ulasiyor mu? Tasarruf, hizmet kalitesi feda edilmeden saglanir."),
         ]
         fin_df = pd.DataFrame(rows_fin, columns=["Veri (Dashboard)", "Algoritma Oncesi",
@@ -1002,8 +1030,8 @@ with tabB:
             mcc[0].metric("Toplam Tasarruf (ort)", fmt_tl(mc["totals"].mean()),
                           f"±{fmt_tl(mc['totals'].std())} (std)")
             mcc[1].metric("Yillik (ort)", fmt_tl(mc["annuals"].mean()))
-            mcc[2].metric("Tamamlanma (ort)", f"%{mc['comps'].mean():.1f}")
-            mcc[3].metric("Opt Tepe (ort)", f"{mc['peaks'].mean():.0f} kW")
+            mcc[2].metric("Tamamlanma (ort)", f"%{fmt_num(mc['comps'].mean(), 1)}")
+            mcc[3].metric("Opt Tepe (ort)", f"{fmt_num(mc['peaks'].mean())} kW")
             cv = mc["totals"].std() / max(mc["totals"].mean(), 1e-9) * 100.0
             figm, axm = plt.subplots(figsize=(10, 3))
             axm.hist(mc["totals"], bins=min(12, len(mc["totals"])), color="#1a73e8", alpha=0.8)
@@ -1011,7 +1039,7 @@ with tabB:
             axm.set_xlabel("Toplam Tasarruf (TL)"); axm.set_ylabel("Gun/kosum sayisi")
             axm.legend(fontsize=8); axm.grid(alpha=0.25)
             figm.tight_layout(); st.pyplot(figm); plt.close(figm)
-            st.info(f"Degiskenlik katsayisi (CV) = **%{cv:.1f}**. Dusukse (≈<%15) tasarruf "
+            st.info(f"Degiskenlik katsayisi (CV) = **%{fmt_num(cv, 1)}**. Dusukse (≈<%15) tasarruf "
                     f"sansa az bagli, sonuc saglamdir.")
 
     # ---- N1: Naive baz cizgisi duyarlilik bandi ----
@@ -1047,9 +1075,9 @@ with tabB:
         if "sens" in st.session_state:
             sdf = st.session_state["sens"]
             st.dataframe(sdf.style.format({
-                "Naive Tepe (kW)": "{:.0f}", "Naive 15-dk Tepe (kW)": "{:.0f}",
-                "Opt Tepe (kW)": "{:.0f}", "Asim Cezasi Naive (TL)": "{:,.0f}",
-                "Toplam Tasarruf (TL)": "{:,.0f}", "Yillik (TL)": "{:,.0f}",
+                "Naive Tepe (kW)": _tr(".0f"), "Naive 15-dk Tepe (kW)": _tr(".0f"),
+                "Opt Tepe (kW)": _tr(".0f"), "Asim Cezasi Naive (TL)": _tr(",.0f"),
+                "Toplam Tasarruf (TL)": _tr(",.0f"), "Yillik (TL)": _tr(",.0f"),
             }), use_container_width=True, hide_index=True)
             lo_s = float(sdf["Toplam Tasarruf (TL)"].min())
             hi_s = float(sdf["Toplam Tasarruf (TL)"].max())
@@ -1084,8 +1112,8 @@ with tabB:
             st.session_state["cmp"] = pd.DataFrame(rows)
         if "cmp" in st.session_state:
             st.dataframe(st.session_state["cmp"].style.format({
-                "Kurulu kW": "{:.0f}", "Opt Tepe (kW)": "{:.0f}", "Naive Tepe (kW)": "{:.0f}",
-                "Toplam Tasarruf (TL)": "{:,.0f}", "Tamamlanma (%)": "{:.1f}",
+                "Kurulu kW": _tr(".0f"), "Opt Tepe (kW)": _tr(".0f"), "Naive Tepe (kW)": _tr(".0f"),
+                "Toplam Tasarruf (TL)": _tr(",.0f"), "Tamamlanma (%)": _tr(".1f"),
             }), use_container_width=True, hide_index=True)
 
     # ---- B9: PTF kalibrasyon doğrulama (2026 referans profili) ----

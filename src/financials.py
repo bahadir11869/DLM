@@ -407,12 +407,15 @@ def power_shaving_roi(cfg: SimConfig, peak_opt: float, peak_naive: float) -> Dic
     # deger ASIM CEZASININ onlenmesi + dusuk sozlesme gucu + BUYUME headroom'udur.
     # Ilave istasyon/EV rakamlari, yeni talebin de DLM tavani ALTINDA yonetilmesi
     # kosuluna baglidir (kosulsuz "bedava kapasite" degildir).
+    def _fmtn(x, d=0):
+        s = f"{float(x):,.{d}f}"
+        return s.replace(",", "X").replace(".", ",").replace("X", ".")
     text = (
-        f"Trafo tepe yukunde **%{shave_pct:.0f}** ({shave_kw:.0f} kW) tirasama yapildi; "
-        f"ayni trafoda **{headroom_kw:.0f} kW** buyume payi (headroom) olustu. Bu pay, "
+        f"Trafo tepe yukunde **%{_fmtn(shave_pct)}** ({_fmtn(shave_kw)} kW) tirasama yapildi; "
+        f"ayni trafoda **{_fmtn(headroom_kw)} kW** buyume payi (headroom) olustu. Bu pay, "
         f"yeni talebin de DLM tavani altinda yonetilmesi KOSULUYLA ilave "
         f"**{extra_stations} adet** DC istasyona (veya esdeger baz yuk buyumesine) alan "
-        f"acar; desteklenen EV kapasitesi **%{ev_increase_pct:.0f}** artirilabilir. "
+        f"acar; desteklenen EV kapasitesi **%{_fmtn(ev_increase_pct)}** artirilabilir. "
         f"Trafo-tarafi parasal kazanc, guc asim cezalarinin onlenmesi ve sozlesme "
         f"gucunun dusuk tutulabilmesidir (bu boyutlandirmada termal omur kazanci "
         f"kucuktur; ayrintisi termal bolumde)."
