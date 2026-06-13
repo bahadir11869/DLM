@@ -89,6 +89,14 @@ def run_simulation(scenario, pricing_mode, days, seed, regen_token, fleet_size,
     sn = results["naive"].sessions[["session_id", "charge_duration_min", "completed"]]
     sessions_cmp = so.merge(sn, on="session_id", suffixes=("_opt", "_naive"))
 
+    # #5: istasyon (soket) bazli gunluk tablo icin optimize oturumlari (soket
+    # atamasi + giris saati + sure + verilen enerji).
+    opt_sessions = results["optimized"].sessions[[
+        "session_id", "day", "vehicle_id", "model", "socket_idx", "socket_kw",
+        "arr_min", "start_min", "finish_min", "charge_duration_min",
+        "delivered_kwh", "completed",
+    ]].copy()
+
     return {
         "cfg_days": days, "rated_kw": cfg.station.rated_kw,
         "transformer_kva": cfg.station.transformer_kva, "power_factor": cfg.station.power_factor,
@@ -103,6 +111,8 @@ def run_simulation(scenario, pricing_mode, days, seed, regen_token, fleet_size,
         "base_peak_frac": float(base_load.max() / cfg.station.rated_kw),
         "max_install_kw": float(cfg.station.rated_kw - base_load.min()),
         "sessions_cmp": sessions_cmp,
+        "opt_sessions": opt_sessions,
+        "socket_power_opt": results["optimized"].socket_power_kw,  # #4: (T × n_sock)
         "base_load": base_load,
         "facility_opt": results["optimized"].facility_kw,
         "facility_naive": results["naive"].facility_kw,
@@ -150,6 +160,14 @@ def fmt_num(x, decimals=0, sign=False):
     else:
         s = f"{float(x):,.{decimals}f}"
     return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _hhmm(h):
+    """Saat (ondalik) -> 'HH:MM'."""
+    h = float(h); hh = int(h); mm = int(round((h - hh) * 60))
+    if mm == 60:
+        hh += 1; mm = 0
+    return f"{hh:02d}:{mm:02d}"
 
 
 def _tr(fmt_str):
@@ -215,17 +233,17 @@ days = int(sim_months * 30)
 st.sidebar.caption(f"≈ {days} gun ({sim_months} ay) simule edilecek.")
 
 st.sidebar.markdown("#### 🚗 Arac Sayisi (Filo)")
-fleet_size = st.sidebar.slider("Kalici filo buyuklugu (arac)", 5, 150,
-    30 if scenario == "FABRIKA" else 80,
-    help="Sisteme kayitli, tum simulasyon boyunca tekrar tekrar sarj olan arac sayisi.")
+fleet_size = st.sidebar.slider("Kalici filo buyuklugu (arac)", 5, 150, 10,
+    help="Sisteme kayitli, tum simulasyon boyunca tekrar tekrar sarj olan arac sayisi (default 10).")
 
 st.sidebar.markdown("#### 🔌 DC Sarj Istasyonlari (tek soketli)")
-st.sidebar.caption("Her istasyon TEK soketlidir (ayni anda tek arac). Varsayilan kurulum "
-                   "(2/1/1 = 700 kW), cesitlilik faktoruyle trafo anmasinin ~%20-30'unda kalir.")
+st.sidebar.caption("Her istasyon TEK soketlidir (ayni anda tek arac). DEFAULT kurulum "
+                   "2×200 = 400 kW; baz yuk yuksek tutuldugu icin baz+sarj sozlesmeyi asar "
+                   "(algoritmasiz ceza olusur, DLM tirasalar).")
 c1, c2, c3 = st.sidebar.columns(3)
 n200 = c1.number_input("200 kW", 0, 12, 2)
-n180 = c2.number_input("180 kW", 0, 12, 1)
-n120 = c3.number_input("120 kW", 0, 12, 1)
+n180 = c2.number_input("180 kW", 0, 12, 0)
+n120 = c3.number_input("120 kW", 0, 12, 0)
 
 with st.sidebar.expander("⚙️ Gelismis: Guc Faktoru · Verim · Cesitlilik", expanded=False):
     pf = st.slider("Ortalama guc faktoru (cosφ)", 0.85, 1.00, 0.95, 0.01,
@@ -365,6 +383,12 @@ if st.session_state.get("_do_run"):
             pct: run_simulation(base_mult=1.0 + pct / 100.0, **st.session_state["params"])
             for pct in (10, 15, 20)
         }
+        # SENARYO D (#1): FILO +%10 buyume. Ayni donanim/sozlesme, %10 daha cok arac.
+        # (Baz-yuk +%10/15/20 sweep paneli yalnizca Normal sekmede gosterilir; growth
+        # sekmesinde tekrar olmamasi + hiz icin PBASE_GROW hesaplanmaz.)
+        grow_params = dict(st.session_state["params"])
+        grow_params["fleet_size"] = max(1, int(round(int(fleet_size) * 1.10)))
+        st.session_state["payload_grow"] = run_simulation(base_mult=1.0, **grow_params)
     st.session_state["_do_run"] = False
 
 if "payload" not in st.session_state:
@@ -389,8 +413,8 @@ naive_peak_pct = P["peak_naive"] / rated * 100.0
 gr = st.columns(4)
 gr[0].metric("Trafo Etkin Anma", f"{fmt_num(rated)} kW", f"{fmt_num(P['transformer_kva'])} kVA × {fmt_num(P['power_factor'], 2)}")
 gr[1].metric("Kurulu İstasyon", f"{fmt_num(installed)} kW", f"cesitlilik {fmt_num(div, 2)}")
-gr[2].metric("Cesitlilikli Talep", f"{fmt_num(diversified)} kW", f"%{fmt_num(div_pct)} trafo (hedef %20-30)")
-gr[3].metric("Baz Yuk Tepe", f"{fmt_num(P['base_max_kw'])} kW", f"%{fmt_num(base_pct)} trafo (hedef %60)")
+gr[2].metric("Cesitlilikli Talep", f"{fmt_num(diversified)} kW", f"%{fmt_num(div_pct)} trafo")
+gr[3].metric("Baz Yuk Tepe", f"{fmt_num(P['base_max_kw'])} kW", f"%{fmt_num(base_pct)} trafo")
 
 if naive_peak_pct <= 100.0:
     st.success(f"✅ **Overload YOK** (madde 9): algoritma ÖNCESI (algoritmasiz) tepe "
@@ -401,9 +425,18 @@ else:
     st.warning(f"⚠️ Algoritma oncesi (algoritmasiz) tepe **{fmt_num(P['peak_naive'])} kW** trafo "
         f"anmasini (%{fmt_num(naive_peak_pct)}) asiyor. Istasyon sayisini azaltin veya cesitlilik "
         f"faktorunu dusurun (madde 9: algoritma oncesi bile overload olmamali).")
-if not (20.0 <= div_pct <= 30.0):
-    st.info(f"ℹ️ Cesitlilikli istasyon talebi trafo anmasinin **%{fmt_num(div_pct)}**'i "
-        f"(hedef aralik %20-%30). Istasyon sayisini/cesitlilik faktorunu buna gore ayarlayin.")
+# YENI TASARIM kontrolu: senaryo ANLAMLI mi? Algoritmasiz tepe SOZLESME gucunu asip
+# (DLM'in tirasayacagi ceza) ama trafoyu asmamali. (Eski %20-30 cesitlilik bandi,
+# 700 kW parka ozeldi; default artik 400 kW + yuksek baz.)
+_contract = P["contracted_kw"]
+if P["peak_naive"] <= _contract + 0.5:
+    st.info(f"ℹ️ Algoritmasiz tepe (**{fmt_num(P['peak_naive'])} kW**) sozlesme gucunu "
+        f"({fmt_num(_contract)} kW) ASMIYOR → bu kurulumda DLM'in onleyecegi asim cezasi yok. "
+        f"Senaryoyu canlandirmak icin baz yuku/filoyu artirin veya sozlesme gucunu dusurun.")
+else:
+    st.caption(f"🎯 Senaryo anlamli: algoritmasiz tepe **{fmt_num(P['peak_naive'])} kW** sozlesmeyi "
+        f"({fmt_num(_contract)} kW) **{fmt_num(P['peak_naive']-_contract)} kW** asar (ceza olusur); "
+        f"DLM tepeyi sozlesmeye kirpar. Cesitlilikli talep trafonun %{fmt_num(div_pct)}'i.")
 
 st.caption(
     f"⚖️ Aktif gerceklik ayarlari: guc bedeli rejimi **{P['billing_mode']}** "
@@ -437,15 +470,19 @@ k[3].metric("Ort. Sarj Suresi (Algo)", f"{fmt_num(A['costs_opt']['avg_charge_dur
                  "asiri uzamasi engellenir.")
 
 sim_months_disp = P["cfg_days"] / 30.0
-tabA, tabB = st.tabs(["📅 BOLUM A · 1 Gunluk Mikro Analiz",
-                      f"📈 BOLUM B · {sim_months_disp:.0f} Aylik ({P['cfg_days']} gun) Makro Analiz"])
+
 
 # =========================================================================== #
-# BOLUM A
+# SENARYO RENDER FONKSIYONU (#1): C=Normal, D=%10 Filo Buyume sekmeleri ayni
+# icerigi (gunluk mikro + aylik makro) kendi payload'larindan uretir. Donanim
+# sabitleri (rated/installed/contract) iki senaryoda AYNI oldugu icin globaldir;
+# senaryo verisi P/A/pbase parametrelerinden gelir. 'key' tum widget ve
+# session_state cache anahtarlarina son-ek olarak eklenir (iki sekme cakismaz).
 # =========================================================================== #
-with tabA:
+def render_scenario(P, A, pbase, key):
+    # ---------------- BOLUM A: 1 Gunluk Mikro Analiz ----------------
     cp1, cp2 = st.columns([1, 2])
-    sel_date = cp1.date_input("Gun sec (takvim)",
+    sel_date = cp1.date_input("Gun sec (takvim)", key=f"date_{key}",
         value=START_DATE + _dt.timedelta(days=min(2, P["cfg_days"] - 1)),
         min_value=START_DATE, max_value=START_DATE + _dt.timedelta(days=P["cfg_days"] - 1))
     day = int(np.clip((sel_date - START_DATE).days, 0, P["cfg_days"] - 1))
@@ -462,12 +499,12 @@ with tabA:
                    "goturdugunde o andaki TUM kW degerleri ve fiyat (PTF/tarife) birlikte gosterilir. "
                    "Yakinlastirma/kaydirma ve seri ac-kapa (lejant tiklamasi) desteklenir.")
         g = st.columns(6)
-        show_base = g[0].checkbox("Baz Yuk", True)
-        show_naive = g[1].checkbox("Algoritma Oncesi", True)
-        show_opt = g[2].checkbox("Algoritma Sonrasi", True)
-        show_rated = g[3].checkbox("Trafo Anma", True)
-        show_contract = g[4].checkbox("Sozlesme Gucu", True)
-        show_price = g[5].checkbox("Fiyat Egrisi", True)
+        show_base = g[0].checkbox("Baz Yuk", True, key=f"cb_base_{key}")
+        show_naive = g[1].checkbox("Algoritma Oncesi", True, key=f"cb_naive_{key}")
+        show_opt = g[2].checkbox("Algoritma Sonrasi", True, key=f"cb_opt_{key}")
+        show_rated = g[3].checkbox("Trafo Anma", True, key=f"cb_rated_{key}")
+        show_contract = g[4].checkbox("Sozlesme Gucu", True, key=f"cb_contract_{key}")
+        show_price = g[5].checkbox("Fiyat Egrisi", True, key=f"cb_price_{key}")
 
         plabel = "PTF (TL/kWh)" if P["pricing_mode"] == "PTF" else "Tarife (TL/kWh)"
         figp = go.Figure()
@@ -502,7 +539,7 @@ with tabA:
         )
         st.plotly_chart(figp, use_container_width=True)
         # Ek olarak: secilen saatte tam okuma (slider) — grafik hover'ina alternatif kesin deger.
-        t_hour = st.slider("İmleç — saat (t) sec", 0.0, 23.98, 12.0, 0.25, key="cursor_hour",
+        t_hour = st.slider("İmleç — saat (t) sec", 0.0, 23.98, 12.0, 0.25, key=f"cursor_{key}",
                            help="Grafikteki herhangi bir t anini bu imlecle de secip kesin kW/fiyat okuyabilirsiniz.")
         ti = int(round(t_hour * 60)) % MINUTES_PER_DAY
         rc = st.columns(4)
@@ -556,6 +593,79 @@ with tabA:
                 "Sure — Oncesi (dk)": "{:.0f}", "Sure — Sonrasi (dk)": "{:.0f}",
                 "Uzama (dk)": "{:+.0f}",
             }), use_container_width=True, hide_index=True, height=320)
+
+    # ---- #5: ISTASYON (SOKET) BAZLI GUNLUK TABLO — giren araclar, saat, sure, verilen guc ----
+    with st.expander("🔌 Istasyon (Soket) Bazli Gunluk Doluluk — Giren Araclar · Saat · Sure · Verilen Guc",
+                     expanded=True):
+        st.caption(f"{day+1}. gun ({sel_date.strftime('%d.%m.%Y')}): HER SOKETE o gun giren araclar, "
+                   "giris saati, sarj suresi ve verilen enerji/ortalama guc — soketler YAN YANA. "
+                   "(Algoritma sonrasi/optimize dagilimi.)")
+        osd = P["opt_sessions"]
+        day_os = osd[(osd["day"] == day) & (osd["socket_idx"] >= 0)].copy()
+        sock_kw_list = sorted(P["_socket_list"], reverse=True)  # gosterim sirasi (buyukten)
+        if len(day_os) == 0:
+            st.info("Bu gun hicbir sokete arac girmedi.")
+        else:
+            # start_min -> gun-ici saat; ortalama guc = enerji / (sure/60)
+            def _mod(x):
+                return f"{int(x) % MINUTES_PER_DAY // 60:02d}:{int(x) % 60:02d}"
+            # soket index -> guc sinifi etiketi (optimizer sock_cap = buyukten kucuge sirali)
+            scols = st.columns(int(P["_n_sockets"]))
+            # her soket index'i icin alt tablo (yan yana)
+            for ssi in range(int(P["_n_sockets"])):
+                sub = day_os[day_os["socket_idx"] == ssi].sort_values("start_min")
+                kw = sock_kw_list[ssi] if ssi < len(sock_kw_list) else float(sub["socket_kw"].max() if len(sub) else 0)
+                with scols[ssi]:
+                    st.markdown(f"**Soket {ssi+1} · {fmt_num(kw)} kW**")
+                    if len(sub) == 0:
+                        st.caption("— bu gun bos —")
+                        continue
+                    dur = sub["charge_duration_min"].values
+                    deliv = sub["delivered_kwh"].values
+                    avg_pw = np.where(dur > 0, deliv / (dur / 60.0), 0.0)
+                    sub_tbl = pd.DataFrame({
+                        "Arac": sub["vehicle_id"].values,
+                        "Giris": [_mod(v) for v in sub["start_min"].values],
+                        "Sure (dk)": dur,
+                        "Enerji (kWh)": deliv,
+                        "Ort. Guc (kW)": avg_pw,
+                    })
+                    st.dataframe(sub_tbl.style.format({
+                        "Sure (dk)": "{:.0f}", "Enerji (kWh)": "{:.1f}", "Ort. Guc (kW)": "{:.0f}",
+                    }), use_container_width=True, hide_index=True, height=240)
+                    st.caption(f"{len(sub)} arac · toplam {fmt_num(float(deliv.sum()),1)} kWh")
+
+        # ---- DAKIKA BAZINDA SOKET GUCU (#4): her soketin gun-ici verdigi guc egrisi ----
+        spw = P.get("socket_power_opt")
+        if spw is not None:
+            st.markdown("**⏱️ Dakika Bazinda Soket Gucu** — imlecle herhangi bir saate gel, "
+                        "her soketin o an verdigi gucu birlikte oku (ornek: 18:13'te 1. ve 2. soket).")
+            spd = np.asarray(spw)[lo:hi, :]            # (1440 × n_sock) o gun
+            xm = np.arange(MINUTES_PER_DAY) / 60.0
+            _palette = ["#1a73e8", "#1e8e3e", "#d93025", "#9334e6", "#ea8600",
+                        "#00897b", "#5f6368", "#c2185b"]
+            figsp = go.Figure()
+            for ssi in range(min(int(P["_n_sockets"]), spd.shape[1])):
+                kw = sock_kw_list[ssi] if ssi < len(sock_kw_list) else 0
+                figsp.add_trace(go.Scatter(
+                    x=xm, y=spd[:, ssi], name=f"Soket {ssi+1} ({fmt_num(kw)} kW)",
+                    line=dict(color=_palette[ssi % len(_palette)], width=2),
+                    hovertemplate=f"Soket {ssi+1}: %{{y:.0f}} kW<extra></extra>"))
+            figsp.update_layout(
+                height=340, hovermode="x unified", margin=dict(l=10, r=10, t=30, b=10),
+                xaxis=dict(title="Saat", dtick=2, range=[0, 24], ticksuffix=":00"),
+                yaxis=dict(title="Soket Gucu (kW)"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
+            st.plotly_chart(figsp, use_container_width=True)
+            # Belirli bir dakikada kesin okuma (imlece alternatif)
+            tsel = st.slider("Dakika sec (saat:dk okuma)", 0.0, 23.98, 18.0, 1.0 / 60.0,
+                             key=f"sockpw_{key}", format="%.2f")
+            ti = int(round(tsel * 60)) % MINUTES_PER_DAY
+            rc = st.columns(min(int(P["_n_sockets"]), spd.shape[1]) + 1)
+            rc[0].metric("Saat", _hhmm(tsel))
+            for ssi in range(min(int(P["_n_sockets"]), spd.shape[1])):
+                kw = sock_kw_list[ssi] if ssi < len(sock_kw_list) else 0
+                rc[ssi + 1].metric(f"Soket {ssi+1} ({fmt_num(kw)} kW)", f"{fmt_num(spd[ti, ssi])} kW")
 
     cost_naive = float(np.sum(chg_naive * dt * price_d))
     cost_opt = float(np.sum(chg_opt * dt * price_d))
@@ -621,10 +731,7 @@ with tabA:
         st.caption("ℹ️ Sozlesme gucu artirmanin maliyeti ve uzun-vadeli finansal karsiliklar "
                    "BOLUM B'de (makro analiz) detaylandirilir.")
 
-# =========================================================================== #
-# BOLUM B
-# =========================================================================== #
-with tabB:
+    # ---------------- BOLUM B: Aylik Makro Analiz ----------------
     th_o = A["thermal_opt"]; th_n = A["thermal_naive"]; soh = A["soh"]
     days_axis = np.arange(P["cfg_days"]) + 1
     # TAKVIM EKSENI (madde 1): grafikler gun yerine GERCEK TARIH ile etiketlenir;
@@ -727,9 +834,9 @@ with tabB:
                    "ONCESI ve SONRASI icin guc asim cezasi (EPDK, 15-dk tepe) ve TRAFO OMUR "
                    "TUKETIMI yeniden hesaplanir. Sicak-nokta arttikca yaslanma USTEL (V=2^((θh−98)/6)) "
                    "buyudugu icin, baz yuk buyudukce algoritmanin TERMAL kazanci da buyur.")
-        if "PBASE" in st.session_state:
+        if pbase:
             scen_list = [("Mevcut (+%0)", P)] + [
-                (f"+%{pct}", st.session_state["PBASE"][pct]) for pct in sorted(st.session_state["PBASE"])
+                (f"+%{pct}", pbase[pct]) for pct in sorted(pbase)
             ]
             rows_b = []
             for nm, R in scen_list:
@@ -757,7 +864,7 @@ with tabB:
                 "Termal Tasarruf (TL)": _tr(",.0f"), "Toplam Tasarruf (TL)": _tr(",.0f"),
             }), use_container_width=True, hide_index=True)
 
-            P20 = st.session_state["PBASE"][max(st.session_state["PBASE"])]
+            P20 = pbase[max(pbase)]
             A20 = P20["analysis"]
             th_gain_now = A["thermal_saving_tl"]
             th_gain_20 = A20["thermal_saving_tl"]
@@ -777,78 +884,84 @@ with tabB:
             st.info("Ceza = Σ_ay max(0, 15-dk ortalama tepe − sozlesme) × güç bedeli × ceza katı "
                     "(EPDK/OSOS — N3). Omur tuketimi: IEC 60076-7 fark-denklemi, donem yuzdesi "
                     "30 yillik omur butcesine gore.")
+        else:
+            st.caption("ℹ️ Baz yuk artis sweep'i **Normal Senaryo (C)** sekmesinde detaylandirilir "
+                       "(burada tekrar edilmez).")
 
-    # ---- FILO BUYUME KAPASITESI: cezasiz maks arac sayisi (madde 3) ----
-    with st.expander("🚛 Filo Buyume Kapasitesi — Cezasiz Maks Arac Sayisi (Oncesi vs Sonrasi)", expanded=True):
-        st.caption("Mevcut soket kurulumu ve sozlesme gucu SABITKEN: algoritma ONCESI (algoritmasiz) "
-                   "kac araclik filo, trafo/sozlesme ASIM CEZASI yemeden sarj edilebilir? Ayni soru "
-                   "algoritma SONRASI icin de cevaplanir (optimize tepeyi sozlesmeye kirptigi icin "
-                   "ceza olusmaz; sinir, hizmet kalitesidir: tamamlanma ≥ %98). Arama hizi icin "
-                   "30 gunluk pencere kullanilir; sonuc ± birkac arac belirsizlik tasir (stokastik oturumlar).")
-        if st.button("🚛 Maks Filoyu Hesapla"):
+    # ---- FILO BUYUME KAPASITESI: DLM ile cezasiz maks filo (duzeltildi - madde 3) ----
+    with st.expander("🚛 Filo Buyume Kapasitesi — DLM ile Cezasiz Maks Filo", expanded=True):
+        st.caption(
+            "Mevcut soket kurulumu ve sozlesme gucu SABITKEN: DLM ile (guc asim cezasi YOK **ve** "
+            "tamamlanma ≥ %98) en fazla kac araclik filo desteklenir? Bu, **mevcut filo** ile "
+            "kiyaslanir; ayrica mevcut filoda **algoritmasiz** isletmenin odeyecegi asim cezasi "
+            "gosterilir. NOT: 'algoritmasiz maks cezasiz filo' metrigi bu modelde anlamsizdir — "
+            "cesitlilik tavani naive tepesini ~sabit (baz+cesitlilik) yaptigi icin naive ya hep "
+            "cezalidir ya hic; bu yuzden kiyas DLM kapasitesi vs mevcut filo uzerinden yapilir. "
+            "(30 gunluk arama penceresi; ± birkac arac belirsizlik.)")
+        if st.button("🚛 Maks Filoyu Hesapla", key=f"fleetbtn_{key}"):
             SEARCH_DAYS = 30
-            FLEET_HI = 300
+            FLEET_HI = 150
 
             def _fleet_run(n_veh):
                 bp = dict(st.session_state["params"])
                 bp["fleet_size"] = int(n_veh); bp["days"] = SEARCH_DAYS
                 return run_simulation(base_mult=1.0, **bp)
 
-            def _naive_ok(r):       # cezasiz: 15-dk tepe sozlesmeyi asmiyor
-                return r["demand_penalty_naive"] <= 0.5
-
-            def _opt_ok(r):         # ceza zaten ~0; sinir hizmet kalitesi
+            def _opt_ok(r):     # cezasiz + tamamlanma >= %98 (DLM hizmet kapasitesi)
                 return (r["demand_penalty_opt"] <= 0.5
                         and r["analysis"]["costs_opt"]["completion_rate"] >= 0.98)
 
-            def _max_fleet(ok_fn, prog, p0, p1):
-                lo, hi = 2, FLEET_HI
-                if not ok_fn(_fleet_run(lo)):
-                    return 0
-                prog.progress(p0 + 0.1 * (p1 - p0))
-                if ok_fn(_fleet_run(hi)):
-                    return hi
+            prog = st.progress(0.0, text="DLM cezasiz maks filo araniyor...")
+            lo, hi = 2, FLEET_HI
+            if not _opt_ok(_fleet_run(lo)):
+                n_opt = 0
+            elif _opt_ok(_fleet_run(hi)):
+                n_opt = hi
+            else:
                 step = 0
-                while hi - lo > 1:                 # ikili arama (~8 adim)
+                while hi - lo > 1:
                     mid = (lo + hi) // 2
-                    if ok_fn(_fleet_run(mid)):
+                    if _opt_ok(_fleet_run(mid)):
                         lo = mid
                     else:
                         hi = mid
                     step += 1
-                    prog.progress(min(p0 + (0.1 + 0.9 * step / 9.0) * (p1 - p0), p1))
-                return lo
-
-            prog = st.progress(0.0, text="Algoritma oncesi (cezasiz) maks filo araniyor...")
-            n_naive = _max_fleet(_naive_ok, prog, 0.0, 0.5)
-            prog.progress(0.5, text="Algoritma sonrasi (tamamlanma ≥ %98) maks filo araniyor...")
-            n_opt = _max_fleet(_opt_ok, prog, 0.5, 1.0)
+                    prog.progress(min(0.1 + 0.9 * step / 9.0, 1.0))
+                n_opt = lo
             prog.empty()
-            st.session_state["fleet_cap"] = (n_naive, n_opt)
-        if "fleet_cap" in st.session_state:
-            n_naive, n_opt = st.session_state["fleet_cap"]
-            growth = n_opt - n_naive
-            growth_pct = (growth / max(n_naive, 1)) * 100.0
+            st.session_state[f"fleet_cap_{key}"] = int(n_opt)
+        if f"fleet_cap_{key}" in st.session_state:
+            n_opt = st.session_state[f"fleet_cap_{key}"]
+            cur_fleet = int(P["fleet_size"])
+            growth = n_opt - cur_fleet
+            growth_pct = (growth / max(cur_fleet, 1)) * 100.0
+            pen_now = P["demand_penalty_naive"]            # mevcut filoda algoritmasiz ceza (donem)
             fc = st.columns(3)
-            fc[0].metric("Maks Filo — Algoritma Oncesi", f"{n_naive} arac",
-                         help="Bu sayinin ustunde algoritmasiz isletme, sozlesme gucunu (15-dk tepe) "
-                              "asip EPDK asim cezasi yemeye baslar.")
-            fc[1].metric("Maks Filo — Algoritma Sonrasi",
-                         f"{n_opt} arac" + (" (ust sinir)" if n_opt >= 300 else ""),
-                         f"+{growth} arac vs oncesi",
-                         help="Optimize tepe sozlesmeye kirpildigi icin ceza HIC olusmaz; sinir, "
-                              "tamamlanma oraninin %98 altina dusmesidir (soket sayisi belirleyici olabilir).")
-            fc[2].metric("Filo Buyume Kapasitesi", f"%{fmt_num(growth_pct)}",
-                         help="Ayni trafo, ayni soketler, ayni sozlesme gucuyle desteklenebilen ek filo.")
-            if n_opt >= 300:
-                st.info("ℹ️ Algoritma sonrasi limit arama tavanina (300) dayandi; gercek sinir soket "
-                        "sayisi/kuyruk dinamigiyle belirlenir. Soket ekleyerek tekrar deneyin.")
-            st.success(
-                f"💼 **Yatirimci mesaji:** Ayni trafo ve sozlesme gucuyle, algoritmasiz isletme "
-                f"**{n_naive} araclik** filoda ceza sinirina dayanir. DLM ile filo, ceza riski "
-                f"OLMADAN ve %98+ tamamlanma korunarak **{n_opt} araca** buyutulebilir — "
-                f"**+{growth} arac (%{fmt_num(growth_pct)} buyume)**, ilave trafo/sozlesme yatirimi "
-                f"gerektirmeden.")
+            fc[0].metric("Mevcut Filo", f"{cur_fleet} arac",
+                         help="Su an sol panelde secili filo buyuklugu.")
+            fc[1].metric("DLM Cezasiz Maks Filo",
+                         f"{n_opt} arac" + (" (ust sinir)" if n_opt >= 150 else ""),
+                         f"{fmt_num(growth, sign=True)} arac vs mevcut",
+                         help="DLM ile asim cezasi olmadan ve tamamlanma ≥ %98 korunarak tasinabilen "
+                              "en buyuk filo. Ust sinir soket sayisi/kuyruk dinamigidir.")
+            fc[2].metric("Mevcut Filoda Algoritmasiz Asim Cezasi", fmt_tl(pen_now),
+                         help=f"Mevcut {cur_fleet} araclik filoda, algoritmasiz isletmenin {period_lbl} "
+                              f"boyunca odeyecegi guc asim cezasi (DLM bunu sifirlar).")
+            if n_opt >= 150:
+                st.info("ℹ️ Arama tavanina (150) dayandi; gercek sinir soket sayisi/kuyruk dinamigiyle "
+                        "belirlenir. Soket ekleyerek tekrar deneyin.")
+            if n_opt > cur_fleet:
+                st.success(
+                    f"💼 **Yatirimci mesaji:** Mevcut **{cur_fleet} araclik** filoda algoritmasiz "
+                    f"isletme {period_lbl} boyunca **{fmt_tl(pen_now)}** asim cezasi oder (tepe "
+                    f"sozlesmeyi asar). DLM bu cezayi **sifirlar** ve ayni trafo, soket ve sozlesme "
+                    f"gucuyle cezasiz filoyu **{n_opt} araca** (+{growth} arac, %{fmt_num(growth_pct)}) "
+                    f"buyutmeyi mumkun kilar — ilave trafo/sozlesme yatirimi gerektirmeden.")
+            else:
+                st.warning(
+                    f"⚠️ Mevcut {cur_fleet} araclik filo, DLM'in cezasiz+%98 kapasitesinin ({n_opt} arac) "
+                    f"USTUNDE; soket/kuyruk darbogazi var. Soket ekleyin veya filoyu kuculterek "
+                    f"tamamlanma/ceza hedeflerini saglayin. Algoritmasiz mevcut ceza: {fmt_tl(pen_now)}.")
 
     # ---- SOZLESME GUCU ARTIRMA MALIYETI (madde 4, 5) ----
     dc_b = P["demand_charge_tl_per_kw"]
@@ -1008,8 +1121,8 @@ with tabB:
     with st.expander("🎲 Coklu-seed Monte Carlo (tasarruf ne kadar sansa bagli?)", expanded=False):
         st.caption("Ayni parametreler, FARKLI rastgele tohumlarla N kez kosulur; toplam "
                    "tasarrufun ortalamasi ve dagilimi gosterilir. Dar dagilim -> sonuc saglam.")
-        n_runs = st.slider("Tohum (seed) sayisi", 3, 20, 8, key="mc_n")
-        if st.button("🎲 Monte Carlo Calistir"):
+        n_runs = st.slider("Tohum (seed) sayisi", 3, 20, 8, key=f"mcn_{key}")
+        if st.button("🎲 Monte Carlo Calistir", key=f"mcbtn_{key}"):
             bp0 = dict(st.session_state["params"])
             totals, annuals, comps, peaks = [], [], [], []
             prog = st.progress(0.0, text="Simulasyonlar kosuluyor...")
@@ -1022,10 +1135,10 @@ with tabB:
                 peaks.append(r["peak_opt"])
                 prog.progress((i + 1) / n_runs, text=f"{i+1}/{n_runs}")
             prog.empty()
-            st.session_state["mc"] = dict(totals=np.array(totals), annuals=np.array(annuals),
+            st.session_state[f"mc_{key}"] = dict(totals=np.array(totals), annuals=np.array(annuals),
                                           comps=np.array(comps), peaks=np.array(peaks))
-        if "mc" in st.session_state:
-            mc = st.session_state["mc"]
+        if f"mc_{key}" in st.session_state:
+            mc = st.session_state[f"mc_{key}"]
             mcc = st.columns(4)
             mcc[0].metric("Toplam Tasarruf (ort)", fmt_tl(mc["totals"].mean()),
                           f"±{fmt_tl(mc['totals'].std())} (std)")
@@ -1048,7 +1161,7 @@ with tabB:
                    "cesitlilik tavani bir talep tahminidir. Burada ayni kosullar cesitlilik "
                    "0.50/0.60/0.70 ve tavansiz OLAY-TABANLI ust-sinir ile yeniden kosulur; "
                    "sonuclar tek nokta degil BANT olarak okunmalidir.")
-        if st.button("🧪 Duyarlilik Bandini Kos"):
+        if st.button("🧪 Duyarlilik Bandini Kos", key=f"sensbtn_{key}"):
             sens_cases = [
                 ("Cesitlilik 0.50", dict(diversity=0.50, naive_mode="diversity")),
                 ("Cesitlilik 0.60 (varsayilan)", dict(diversity=0.60, naive_mode="diversity")),
@@ -1071,9 +1184,9 @@ with tabB:
                 })
                 prog.progress((j + 1) / len(sens_cases))
             prog.empty()
-            st.session_state["sens"] = pd.DataFrame(rows_s)
-        if "sens" in st.session_state:
-            sdf = st.session_state["sens"]
+            st.session_state[f"sens_{key}"] = pd.DataFrame(rows_s)
+        if f"sens_{key}" in st.session_state:
+            sdf = st.session_state[f"sens_{key}"]
             st.dataframe(sdf.style.format({
                 "Naive Tepe (kW)": _tr(".0f"), "Naive 15-dk Tepe (kW)": _tr(".0f"),
                 "Opt Tepe (kW)": _tr(".0f"), "Asim Cezasi Naive (TL)": _tr(",.0f"),
@@ -1094,7 +1207,7 @@ with tabB:
             "Orta (2/2/2)": (2, 2, 2),
             "Agir (3/3/2)": (3, 3, 2),
         }
-        if st.button("🔧 Kurulumlari Karsilastir"):
+        if st.button("🔧 Kurulumlari Karsilastir", key=f"cmpbtn_{key}"):
             rows = []
             prog = st.progress(0.0)
             items = list(presets.items())
@@ -1109,9 +1222,9 @@ with tabB:
                 })
                 prog.progress((j + 1) / len(items))
             prog.empty()
-            st.session_state["cmp"] = pd.DataFrame(rows)
-        if "cmp" in st.session_state:
-            st.dataframe(st.session_state["cmp"].style.format({
+            st.session_state[f"cmp_{key}"] = pd.DataFrame(rows)
+        if f"cmp_{key}" in st.session_state:
+            st.dataframe(st.session_state[f"cmp_{key}"].style.format({
                 "Kurulu kW": _tr(".0f"), "Opt Tepe (kW)": _tr(".0f"), "Naive Tepe (kW)": _tr(".0f"),
                 "Toplam Tasarruf (TL)": _tr(",.0f"), "Tamamlanma (%)": _tr(".1f"),
             }), use_container_width=True, hide_index=True)
@@ -1153,6 +1266,26 @@ with tabB:
         ], columns=["KPI", "Deger"])
         d1, d2 = st.columns(2)
         d1.download_button("⬇️ KPI Ozeti (CSV)", kpi_df.to_csv(index=False).encode("utf-8-sig"),
-                           "kpi_ozet.csv", "text/csv", use_container_width=True)
+                           "kpi_ozet.csv", "text/csv", use_container_width=True, key=f"dl1_{key}")
         d2.download_button("⬇️ Arac Tablosu (CSV)", soh["table"].to_csv(index=False).encode("utf-8-sig"),
-                           "arac_tablosu.csv", "text/csv", use_container_width=True)
+                           "arac_tablosu.csv", "text/csv", use_container_width=True, key=f"dl2_{key}")
+
+
+# =========================================================================== #
+# SENARYO SEKMELERI (#1): C = Normal, D = %10 Filo Buyume
+# =========================================================================== #
+P_grow = st.session_state.get("payload_grow", P)
+PBASE_norm = st.session_state.get("PBASE", {})
+PBASE_grow = {}   # growth sekmesinde baz-yuk sweep yok (Normal sekmede detayli)
+_grow_fleet = P_grow["fleet_size"]
+tabC, tabD = st.tabs([
+    f"📊 C · Normal Senaryo ({P['fleet_size']} arac)",
+    f"📈 D · %10 Filo Buyume ({_grow_fleet} arac)",
+])
+with tabC:
+    render_scenario(P, A, PBASE_norm, "n")
+with tabD:
+    st.caption(f"🔼 **%10 filo buyume senaryosu:** ayni trafo, soket ve sozlesme gucuyle filo "
+               f"{P['fleet_size']} → **{_grow_fleet} arac** (+%10). Asagidaki tum grafik/tablolar bu "
+               f"buyumus filoya gore yeniden hesaplanmistir; Normal senaryo (C sekmesi) ile kiyaslayin.")
+    render_scenario(P_grow, P_grow["analysis"], PBASE_grow, "g")

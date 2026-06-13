@@ -24,7 +24,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.config import SimConfig, StationConfig, ScenarioConfig, Weights
+from src.config import SimConfig, StationConfig, ScenarioConfig, Weights, FinancialConfig
 from src.optimizer import _waterfill, run_both, SimResult, simulate
 from src.financials import (
     thermal_loss_of_life, transformer_life_projection, summarize_costs, build_price_signal,
@@ -248,11 +248,15 @@ def test_diversity_caps_naive_coincident_demand():
     assert float(naive.charging_kw.max()) <= cap + 1.0
 
 
-def test_diversified_demand_in_target_band_default():
-    # Madde 9: varsayilan kurulumda cesitlilikli talep trafo anmasinin %20-30'unda
-    st = StationConfig()
-    pct = st.diversified_demand_kw / st.rated_kw * 100.0
-    assert 18.0 <= pct <= 32.0
+def test_default_sizing_creates_shavable_overload():
+    # YENI DEFAULT (2x200=400 kW, baz %75): senaryo ANLAMLI olmali ->
+    #   (i) baz yuk TEK BASINA sozlesme gucunu asmaz (EV yokken ceza yok),
+    #   (ii) baz + cesitlilikli sarj talebi sozlesme gucunu ASAR (DLM'in
+    #        tirasayacagi / cezayi onleyecegi bir asim olusur).
+    st = StationConfig(); fin = FinancialConfig()
+    base_peak = st.rated_kw * st.base_peak_frac
+    assert base_peak < fin.contracted_demand_kw
+    assert base_peak + st.diversified_demand_kw > fin.contracted_demand_kw
 
 
 def test_event_naive_exceeds_diversity_cap():

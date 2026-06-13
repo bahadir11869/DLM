@@ -51,10 +51,14 @@ class StationConfig:
     # rated_kw = 1600 x 0.95 = 1520 kW etkin guc.
     power_factor: float = 0.95
 
-    # BAZ YUK TEPE ORANI (madde 9): tesis baz yuk tepesi trafonun bu oranina
-    # ulasir. %60 -> 0.60 x 1520 = 912 kW tepe. Cesitlilikli istasyon talebi
-    # (~%20-30) eklenince bile toplam trafo anmasinin altinda kalir (overload yok).
-    base_peak_frac: float = 0.60          # ≈ 912 kW tepe
+    # BAZ YUK TEPE ORANI (madde 9): tesis baz yuk tepesi trafonun bu oranina ulasir.
+    # KUCUK SARJ PARKI (default 2x200=400 kW) ile senaryoyu ANLAMLI tutmak icin baz
+    # yuk yukseltilmistir: %75 -> 0.75 x 1520 = 1140 kW tepe.
+    #   - baz TEK BASINA (1140) < sozlesme gucu (1300) -> EV olmadan ceza yok.
+    #   - baz + cesitlilikli sarj talebi (1140 + 240 ≈ 1380) > sozlesme (1300)
+    #     -> ALGORITMASIZ ceza olusur (DLM'in tirasayacagi anlamli asim).
+    #   - 1380 < trafo anmasi (1520) -> fiziksel overload YOK; optimize 1300'e kirpar.
+    base_peak_frac: float = 0.75          # ≈ 1140 kW tepe (kucuk parkta senaryoyu canli tutar)
 
     # Optimize stratejinin trafoyu yuklemesine izin verdigi ust sinir (p.u.).
     opt_max_loading_pu: float = 1.00      # optimize: trafoyu asma
@@ -65,9 +69,9 @@ class StationConfig:
     #   kurulu guc = 2x200 + 1x180 + 1x120 = 700 kW
     #   cesitlilikli talep = 700 x 0.60 = 420 kW ≈ trafo anmasinin (1520) %27.6'si
     # Baz tepe (%60) + cesitlilikli istasyon (%27.6) = %87.6 < %100 -> overload YOK.
-    n_socket_200: int = 2     # 2 x 200 kW
-    n_socket_180: int = 1     # 1 x 180 kW
-    n_socket_120: int = 1     # 1 x 120 kW   (toplam 4 soket, 700 kW kurulu)
+    n_socket_200: int = 2     # 2 x 200 kW   (DEFAULT kurulum: toplam 400 kW)
+    n_socket_180: int = 0     # 1 x 180 kW
+    n_socket_120: int = 0     # 1 x 120 kW
 
     # CESITLILIK / ESZAMANLILIK (DIVERSITY) FAKTORU (madde 6):
     # IEC 60364-7-722: bir Yuk Yonetim Sistemi (LMS) YOKSA tasarim cesitlilik
@@ -399,8 +403,8 @@ class ScenarioConfig:
     # Filo, soketleri kuyrukla doyuracak kadar buyuk tutulur; boylece algoritmasiz
     # stratejisi yuksek baz-yuk saatlerinde trafoyu SUREKLI asiri yukler (overload)
     # ve termal yaslanma farki olculebilir hale gelir.
-    fleet_size_avm: int = 80         # duzenli musteri havuzu
-    fleet_size_factory: int = 30     # depo/filo araclari
+    fleet_size_avm: int = 10         # DEFAULT: 10 arac
+    fleet_size_factory: int = 10     # DEFAULT: 10 arac (depo/filo)
 
     # Gunluk sarj olma olasiligi (her arac icin).
     daily_charge_prob_avm: float = 0.80

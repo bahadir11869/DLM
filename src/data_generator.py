@@ -281,6 +281,19 @@ def holiday_mask(cfg: SimConfig) -> np.ndarray:
     )
 
 
+def weekday_by_day(cfg: SimConfig) -> np.ndarray:
+    """
+    GERCEK TAKVIM hafta gunu (0=Pazartesi ... 6=Pazar), gun-bazli (shape: days,).
+    Baz yuk ve oturum uretimi ARTIK sim-goreli (day%7) yerine bunu kullanir; boylece
+    'pazar gunu' (==6) ve resmi tatiller GERCEK takvime hizalanir (madde 3).
+    """
+    start = _sim_start_date(cfg)
+    return np.array(
+        [(start + _dt.timedelta(days=int(d))).weekday() for d in range(cfg.days)],
+        dtype=int,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # 3) Tesis BAZ YUK profili (tepe ≈ %60 trafo - madde 9)
 # --------------------------------------------------------------------------- #
@@ -305,8 +318,11 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
     day_of_sim = minute_idx // MINUTES_PER_DAY
     minute_of_day = minute_idx % MINUTES_PER_DAY
     hour = minute_of_day / 60.0
-    weekday = day_of_sim % 7
+    # GERCEK TAKVIM hafta gunu (madde 3): hafta sonu/pazar takvime hizali olsun.
+    wd_by_day = weekday_by_day(cfg)
+    weekday = wd_by_day[day_of_sim]
     is_weekend = weekday >= 5
+    is_sunday = weekday == 6      # PAZAR (fabrika tam kapali; cumartesi TAM gun calisir)
 
     # RESMI TATIL maskesi (madde 3): tatil gunlerinde baz yuk profili degisir
     # (fabrika: uretim buyuk olcude durur; AVM: ziyaret yogunlugu artar).
@@ -323,8 +339,9 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
             + 0.55 * np.exp(-((hour - 15.5) ** 2) / (2 * 2.2 ** 2))
             + 0.45 * np.exp(-((hour - 19.5) ** 2) / (2 * 2.0 ** 2))  # aksam vardiyasi
         )
-        weekend_mult = np.where(is_weekend, 0.45, 1.0)  # hafta sonu uretim az
-        # Resmi tatil: fabrikada uretim hafta sonundan da az (≈%40 baz seviye).
+        # CUMARTESI TAM GUN calisilir (kullanici): yalniz PAZAR uretim duser (~%45).
+        weekend_mult = np.where(is_sunday, 0.45, 1.0)
+        # Resmi tatil: fabrikada uretim pazardan da az (≈%40 baz seviye).
         weekend_mult = np.where(is_holiday, 0.40, weekend_mult)
     else:
         # AVM: gunduz platosu + aksam tepe.
@@ -344,14 +361,26 @@ def generate_base_load(cfg: SimConfig) -> np.ndarray:
     # Gece tabani sifirlanmasin (A3: anlamsiz cift-clip satiri kaldirildi)
     base_frac = np.clip(base_frac, 0.15, peak)
 
-    # A7: ortak gunluk talep/mevsim faktoru (PTF ile korelasyon). Gunluk olcekle,
-    # sonra tepeyi peak ile sinirla (baz yuk trafoyu tek basina asmasin).
-    df = daily_demand_factor(cfg)
-    base_frac = base_frac * df[day_of_sim]
+    # GUN-BAZLI DEGISKENLIK (gunler tipatip ayni olmasin): iki bilesen eklenir.
+    #  (1) GUN TEPE SEVIYESI: PTF ile koreleli daily_demand_factor, [0.83, 1.0]
+    #      bandina eslenir -> her gunun tepe seviyesi FARKLI ama tasarim tavanini
+    #      (peak) ASMAZ; boylece optimize sarj headroom'u korunur ve baz yuk tek
+    #      basina trafoyu/sozlesmeyi asmaz. Yuksek-talep gunleri tavana yakin.
+    #  (2) GUN-ICI SEKIL JITTERI: her gunun profili biraz farkli (sabah/aksam
+    #      oranlari gunden gune oynar) -> egriler ust uste binmez.
+    df = daily_demand_factor(cfg)                       # A7: PTF korelasyonu (ortak)
+    dmin, dmax = float(df.min()), float(df.max())
+    day_scale = 0.83 + 0.17 * (df - dmin) / max(dmax - dmin, 1e-9)   # -> [0.83, 1.00]
+    base_frac = base_frac * day_scale[day_of_sim]
 
-    noise = rng.normal(0.0, 0.010, size=T)
-    # Madde 9: baz yuk TEPESI trafo anmasinin tam %base_peak_frac'ini (varsayilan
-    # %60) asmaz. Yuksek-talep gunlerinde gunluk faktor tepeyi bu tavanda kirpar.
+    rng_v = np.random.default_rng(cfg.seed + 71)
+    hour_jit = rng_v.normal(1.0, 0.06, size=(days, 24))             # gun×saat sekil oynamasi
+    hour_jit = (hour_jit + np.roll(hour_jit, 1, axis=1) + np.roll(hour_jit, -1, axis=1)) / 3.0
+    base_frac = base_frac * np.repeat(hour_jit.reshape(-1), 60)
+
+    noise = rng.normal(0.0, 0.008, size=T)
+    # Madde 9: baz yuk TEPESI tasarim tavanini (peak) asmaz (guvenlik kirpmasi;
+    # gun-bazli degiskenlik bu tavanin ALTINDA gerceklesir).
     base_frac = np.clip(base_frac + noise, 0.10, peak)
 
     return (base_frac * rated).astype(np.float64)
@@ -468,18 +497,40 @@ def generate_sessions(cfg: SimConfig, fleet: pd.DataFrame) -> pd.DataFrame:
     target = cfg.station.target_soc
     n = len(fleet)
 
-    # (arac x gun) tam carpim, sonra olasilikla filtrele -> vektorize
+    # GERCEK TAKVIM hafta gunu + resmi tatil (madde 3):
+    #   - PAZAR (==6) ve RESMI TATIL: hicbir arac sarj OLMAZ (depo/tesis kapali).
+    #   - PAZAR + RESMI TATIL HARICI (Pzt-Cumartesi): BUTUN araclar girer, TAM GUN
+    #     vardiya (~17:30 doner ve fise takilir). Cumartesi de tam gun calisilir.
+    wd_by_day = weekday_by_day(cfg)              # 0=Pzt..6=Paz (shape: days,)
+    hol_by_day = holiday_mask(cfg)               # resmi tatil (shape: days,)
+    sun_by_day = wd_by_day == 6                   # PAZAR
+    sat_by_day = wd_by_day == 5                   # CUMARTESI (yarim gun)
+    nocharge_by_day = sun_by_day | hol_by_day     # PAZAR + RESMI TATIL -> sarj YOK
+
+    # (arac x gun) tam carpim, sonra GUN-BAZLI olasilikla filtrele -> vektorize
     veh_idx = np.repeat(np.arange(n), days)
     day_id = np.tile(np.arange(days), n)
-    weekday = day_id % 7
+    weekday = wd_by_day[day_id]
     is_weekend = weekday >= 5
+    is_sunday = sun_by_day[day_id]
+    is_saturday = sat_by_day[day_id]
+    is_holiday = hol_by_day[day_id]
+    is_nocharge = nocharge_by_day[day_id]         # pazar veya resmi tatil
 
-    prob = sc.daily_charge_prob()
-    keep = rng.random(veh_idx.shape[0]) < prob
-    veh_idx = veh_idx[keep]
-    day_id = day_id[keep]
-    weekday = weekday[keep]
-    is_weekend = is_weekend[keep]
+    # GUN-BAZLI sarj olasiligi:
+    #   - pazar + tatil: 0 (hic arac girmez)
+    #   - FABRIKA: Pzt-Cumartesi -> 1.0 (BUTUN araclar girer, tam gun)
+    #   - AVM: Pzt-Cumartesi -> stokastik (musteri), pazar/tatil 0
+    base_prob = sc.daily_charge_prob()
+    if sc.is_factory:
+        prob_arr = np.where(is_nocharge, 0.0, 1.0)
+    else:
+        prob_arr = np.where(is_nocharge, 0.0, base_prob)
+    keep = rng.random(veh_idx.shape[0]) < prob_arr
+    veh_idx = veh_idx[keep]; day_id = day_id[keep]
+    weekday = weekday[keep]; is_weekend = is_weekend[keep]
+    is_sunday = is_sunday[keep]; is_saturday = is_saturday[keep]
+    is_holiday = is_holiday[keep]
     m = veh_idx.shape[0]
 
     capacity = fleet["capacity"].values[veh_idx]
@@ -496,16 +547,14 @@ def generate_sessions(cfg: SimConfig, fleet: pd.DataFrame) -> pd.DataFrame:
 
     # Gelis dakikasi ve deadline
     if sc.is_factory:
-        # LOJISTIK DEPO SURGE: tum filo vardiya sonunda (17:00-19:00) ESZAMANLI
-        # doner ve fise takilir. 8 soket kuyrukla dolar; aksam baz yuku hala
-        # yuksekken (vardiya omzu) algoritmasiz toplam yuku trafonun USTUNE cikarir
-        # ve bu durum saatlerce surer -> gercek termal asiri yuklenme (overload).
-        # Araclar ertesi sabah 05:00-07:00 cikar (gece bekleyebilir, delay cap yok).
+        # Pzt-Cumartesi (tam gun): tum filo TAM vardiya sonunda (~17:30) ESZAMANLI
+        # doner ve fise takilir (depo surge). (Pazar/tatil gunlerinde oturum yok.)
         arr_min = np.clip(rng.normal(17.5 * 60, 0.5 * 60, size=m), 16 * 60 + 30, 19 * 60).astype(int)
+        # Cikis: ertesi sabah 05:00-07:00 (gece bekleyebilir, delay cap yok).
         dep_off = rng.integers(5 * 60, 7 * 60, size=m)
         dep_global = day_id * MINUTES_PER_DAY + MINUTES_PER_DAY + dep_off
     else:
-        # AVM: 09:00-20:00 gelis; kalma Max Delay Cap ile sinirli.
+        # AVM: 09:00-20:00 gelis (Pzt-Cumartesi tam gun). Pazar/tatil yok.
         arr_min = np.clip(rng.normal(15.0 * 60, 2.5 * 60, size=m), 9 * 60, 20 * 60).astype(int)
         stay = np.clip(
             rng.normal(0.7 * sc.avm_max_stay_min, 0.25 * sc.avm_max_stay_min, size=m),
@@ -525,6 +574,9 @@ def generate_sessions(cfg: SimConfig, fleet: pd.DataFrame) -> pd.DataFrame:
         "day": day_id,
         "weekday": weekday,
         "is_weekend": is_weekend,
+        "is_saturday": is_saturday,
+        "is_sunday": is_sunday,
+        "is_holiday": is_holiday,
         "capacity": capacity,
         "dc_max": dc_max,
         "arrival_soc": arrival_soc,

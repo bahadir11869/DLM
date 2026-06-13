@@ -123,6 +123,7 @@ class SimResult:
     headroom_kw: np.ndarray      # optimize icin C(t) (kW)
     price_tl_kwh: np.ndarray     # dakika bazli enerji fiyati (TL/kWh)
     sessions: pd.DataFrame       # oturum bazli sonuclar (vehicle_id, day, ...)
+    socket_power_kw: np.ndarray = None   # #4: (T × n_sock) her soketin dakikalik verdigi guc
 
 
 # --------------------------------------------------------------------------- #
@@ -189,6 +190,9 @@ def simulate(
     stress_thr = np.zeros(n)
     start_min = np.full(n, -1, np.int64)
     finish_min = np.full(n, -1, np.int64)
+    # Hangi arac hangi SOKETTE sarj oldu (#5 istasyon-bazli tablo icin).
+    sess_socket_idx = np.full(n, -1, np.int64)     # soket index (0..n_sock-1)
+    sess_socket_kw = np.full(n, 0.0, np.float64)   # soketin guc sinifi (kW)
 
     sock_cap = np.sort(np.array(st.socket_list(), dtype=np.float64))[::-1]
     n_sock = sock_cap.shape[0]
@@ -206,6 +210,9 @@ def simulate(
 
     charging_out = np.zeros(T)
     headroom_out = np.zeros(T)
+    # #4: dakika × SOKET batarya tarafi guc matrisi (her soketin o dakika ARACA
+    # verdigi guc). Istasyon-bazli dakikalik guc gosterimi icin.
+    socket_power = np.zeros((T, n_sock), dtype=np.float64)
 
     order = np.argsort(arr)
     ptr = 0
@@ -248,6 +255,8 @@ def simulate(
             free_sockets.remove(best)
             if start_min[i] < 0:
                 start_min[i] = t
+            sess_socket_idx[i] = best          # #5: hangi sokete atandi
+            sess_socket_kw[i] = sock_cap[best]
 
         # (e) aktif araclarin vektorel hesabi
         occ = np.where(sock_veh >= 0)[0]
@@ -421,6 +430,7 @@ def simulate(
         crate = alloc / cap_a                    # batarya C-rate (SOH stresi)
         stress_thr[veh] += energy * (1.0 + cfg.financial.soh_crate_k * crate ** 2)
 
+        socket_power[t, occ] = alloc             # #4: her soketin o dakika verdigi guc
         prev_total = float(alloc.sum())          # batarya tarafi (ramp referansi)
         charging_out[t] = prev_total / eff       # SEBEKE tarafi (trafo yuku + faturalanan)
 
@@ -432,6 +442,8 @@ def simulate(
     res["completed"] = soc >= target - 1e-3
     res["start_min"] = start_min
     res["finish_min"] = finish_min
+    res["socket_idx"] = sess_socket_idx       # #5: atanan soket index (-1 = hic baglanmadi)
+    res["socket_kw"] = sess_socket_kw          # #5: soketin guc sinifi (kW)
     dur = np.where((finish_min >= 0) & (start_min >= 0), finish_min - start_min, np.nan).astype(float)
     res["charge_duration_min"] = dur
 
@@ -444,6 +456,7 @@ def simulate(
         headroom_kw=headroom_out,
         price_tl_kwh=price_tl_kwh,
         sessions=res,
+        socket_power_kw=socket_power,
     )
 
 
